@@ -940,9 +940,27 @@ textarea{resize:vertical;min-height:52px}
       <h2>Register (name &rarr; mobile &rarr; OTP)</h2>
       <div class="stack">
         <input id="rname" type="text" placeholder="Name">
-        <input id="rmobile" type="text" placeholder="Mobile number" inputmode="numeric">
+        <input id="rmobile" type="text" placeholder="Mobile number">
         <button class="btn go" onclick="register()">Run registration</button>
-        <p class="hint">Fills the form, waits for the OTP from ${OTP_SENDER} (sent by the Forwarder app), enters it and moves on.</p>
+        <p class="hint">Fills the form, waits for an OTP SMS (any number), enters it and confirms.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Tap test &mdash; click each to check it lands on the right spot</h2>
+      <div class="row" id="taps"></div>
+    </div>
+
+    <div class="card">
+      <h2>Clipboard</h2>
+      <div class="stack">
+        <input id="clip" type="text" placeholder="Text to copy to the device clipboard">
+        <div class="inline">
+          <button class="btn go grow" onclick="copyText()">Copy to clipboard</button>
+          <button class="btn" onclick="call('paste-clipboard',{})">Paste (Ctrl+V)</button>
+          <button class="btn" onclick="tapPaste()">Tap app's Paste</button>
+        </div>
+        <p class="hint">Copy sets the device clipboard. Paste sends Ctrl+V. "Tap app's Paste" taps your OTP-page Paste button.</p>
       </div>
     </div>
 
@@ -1009,7 +1027,13 @@ function key(k){call('key',{key:k});}
 function sendText(){const t=$('text').value;if(t==='')return;call('paste',{text:t});}
 function sendOtp(){const v=$('otp').value.trim();if(!v)return;call('otp',/^\\d{4,8}$/.test(v)?{code:v}:{message:v});}
 function app(a){const p=$('pkg').value;localStorage.setItem('rpkg',p);call(a,{package:p});}
-function register(){const mobile=$('rmobile').value.trim();if(!mobile){log('enter a mobile number','log-err');return;}log('registration started — waiting for OTP…');call('register',{name:$('rname').value.trim(),mobile:mobile,package:$('pkg').value});}
+function register(){log('registration started — waiting for OTP…');call('register',{name:$('rname').value.trim(),mobile:$('rmobile').value.trim()});}
+// Tap-test buttons, built from the server's REGISTER coordinates.
+const COORDS=${JSON.stringify(REGISTER)};
+const TAPLABELS={nameXY:'Name field',next1XY:'Next 1',mobileXY:'Mobile field',next2XY:'Next 2',pasteXY:'Paste btn',confirmXY:'Confirm'};
+(function(){const box=$('taps');for(const k in TAPLABELS){const xy=COORDS[k];if(!xy)continue;const b=document.createElement('button');b.className='btn';b.textContent=TAPLABELS[k]+' ('+xy[0]+','+xy[1]+')';b.onclick=()=>call('tap',{x:xy[0],y:xy[1]});box.appendChild(b);}})();
+function copyText(){call('set-clipboard',{text:$('clip').value});}
+function tapPaste(){const xy=COORDS.pasteXY;if(xy)call('tap',{x:xy[0],y:xy[1]});}
 if(K){$('veil').classList.add('hide');loadApps();}
 setInterval(()=>{if($('auto').checked&&!document.hidden)refresh();},1500);
 setInterval(status,2500);
