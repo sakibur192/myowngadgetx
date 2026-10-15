@@ -19,7 +19,7 @@ const { execFile } = require('child_process');
 // ============================ CONFIG ============================
 const PORT = 3900;
 const HOST = '0.0.0.0';
-const API_KEY = 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET'; // openssl rand -hex 24
+const API_KEY = '76344d7de4bda46b0bea0cf8717088e352e0c1c534474abb'; // openssl rand -hex 24
 const ADB = 'adb';
 const DEVICE = '127.0.0.1:5555';
 const DEFAULT_PACKAGE = '';            // your app's package, e.g. 'com.baybex.gadgetx'
@@ -37,16 +37,17 @@ const OTP_SENDER = '01750006696';
 // Your app's registration screen. Adjust the selectors to match your app.
 // Find the real id / text of each field with:  GET /api/ui
 // A selector can be { id: 'etName' } or { text: 'Full name' } or { contains: true, text: 'name' }.
-// IMPORTANT: run  GET /api/ui  on each screen and replace these with your app's real
-// resource-ids, e.g. { id: 'etName' }. Ids are exact and never collide; text guesses can.
+// Registration is a multi-page wizard. Selectors captured from GET /api/ui:
+//   name page  -> name field, Next
+//   mobile page-> mobile field (numeric), Next  (tapping Next sends the OTP)
+//   otp page   -> app's "Paste" button (reads clipboard), Confirm
 const REGISTER = {
-  restartFirst:  true,                 // relaunch the app fresh before registering
-  nameField:     { contains: true, text: 'name' },
-  mobileField:   { contains: true, text: 'mobile' },
-  sendOtpButton: { contains: true, text: 'send otp' },  // the "Send OTP" / "Continue" button
-  otpField:      { contains: true, text: 'enter otp' }, // the OTP input on the next step
-  verifyButton:  { contains: true, text: 'verify' },    // the "Verify" / "Submit" button
-  successText:   null,                 // optional text that proves the next page opened, e.g. 'Home'
+  restartFirst:  true,                          // relaunch the app fresh before registering (needs DEFAULT_PACKAGE)
+  nameField:     { id: 'name_input_view' },     // page 1 name input (accepts pasted text)
+  mobileField:   { id: 'mobile_input_view' },   // page 2 number input (digits injected)
+  nextButton:    { id: 'progress_btn' },        // the Next button, same id on every page
+  otpPasteButton:{ text: 'Paste' },             // page 3: your button that pastes OTP from the clipboard
+  confirmButton: { id: 'button1' },             // page 3: the Confirm button
 };
 
 // Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
@@ -341,6 +342,29 @@ async function findElement(q) {
   }
 }
 
+// Tap an element found by a selector ({id}/{text}/...).
+async function tapSelector(sel, timeout = 15000) {
+  const el = await findElement({ ...sel, timeout });
+  await shell(`input tap ${el.x} ${el.y}`);
+  return el;
+}
+
+// Type digits straight as key events — works in numeric fields where IME paste doesn't.
+async function inputDigits(text) {
+  const digits = String(text).replace(/[^0-9+*#]/g, '');
+  if (!digits) throw new Error('No digits to type from: ' + text);
+  await shell(`input text ${digits}`);
+  return digits;
+}
+
+// Put text on Android's clipboard, so an in-app "Paste" button can read it.
+async function setClipboard(text) {
+  const t = String(text);
+  const arg = /^[0-9]+$/.test(t) ? t : JSON.stringify(t);
+  await shell(`cmd clipboard set-primary-text ${arg}`);
+  return t;
+}
+
 async function currentScreen() {
   const out = await shell('dumpsys window | grep -m1 mCurrentFocus').catch(() => '');
   const m = out.match(/\s([\w.]+)\/([\w.$]+)\}/);
@@ -562,7 +586,7 @@ const actions = {
     return { keyboard: 'ready' };
   },
 
-  // Full registration flow: name -> mobile -> Send OTP -> wait for SMS -> fill OTP -> Verify
+  // Multi-page registration: name -> Next -> mobile -> Next -> wait OTP -> clipboard+Paste -> Confirm
   register: async ({ name, mobile, package: p, restart = REGISTER.restartFirst, otpTimeout = 120000 }) => {
     if (!mobile) throw new Error('mobile is required');
     const done = [];
@@ -572,36 +596,49 @@ const actions = {
       await sleep(3000);
       done.push('app restarted');
     }
-    if (name != null && name !== '') {
-      await actions['type-into']({ ...REGISTER.nameField, value: name, timeout: 20000 });
-      done.push('name filled');
-    }
-    await actions['type-into']({ ...REGISTER.mobileField, value: String(mobile), timeout: 20000 });
-    done.push('mobile filled');
 
-    if (REGISTER.sendOtpButton) {
-      await actions['tap-element']({ ...REGISTER.sendOtpButton, timeout: 15000 });
-      done.push('Send OTP tapped');
-    }
+    // Page 1 — name
+    const nameEl = await findElement({ ...REGISTER.nameField, timeout: 20000 });
+    await shell(`input tap ${nameEl.x} ${nameEl.y}`);
+    await sleep(300);
+    await insertText(name || '');
+    done.push('name entered');
+    await tapSelector(REGISTER.nextButton);
+    done.push('Next (page 1)');
 
-    const otpRes = await actions['wait-otp']({
-      from: OTP_SENDER,
-      field: REGISTER.otpField,
-      submit: REGISTER.verifyButton,
-      timeout: num(otpTimeout, 'otpTimeout', 600000),
-    });
-    done.push('OTP ' + otpRes.otp + ' entered');
+    // Page 2 — mobile (wait for the field to appear, then inject digits)
+    const mobileEl = await findElement({ ...REGISTER.mobileField, timeout: 20000 });
+    await shell(`input tap ${mobileEl.x} ${mobileEl.y}`);
+    await sleep(300);
+    await inputDigits(String(mobile));
+    done.push('mobile entered');
+    await tapSelector(REGISTER.nextButton);        // this requests the OTP
+    done.push('Next (page 2) — OTP requested');
 
-    let movedOn = null;
-    if (REGISTER.successText) {
-      try {
-        await findElement({ contains: true, text: REGISTER.successText, timeout: 15000 });
-        movedOn = true;
-      } catch {
-        movedOn = false;
-      }
+    // Wait for the OTP SMS forwarded from the SIM phone
+    const sms = await waitForSms({ from: OTP_SENDER, timeout: num(otpTimeout, 'otpTimeout', 600000) });
+    done.push('OTP received: ' + sms.otp);
+
+    // Page 3 — put OTP on clipboard, tap the app's Paste button, then Confirm
+    await setClipboard(sms.otp);
+    await tapSelector(REGISTER.otpPasteButton, 20000);
+    done.push('Paste tapped');
+    await sleep(600);
+    await tapSelector(REGISTER.confirmButton, 10000);
+    done.push('Confirm tapped');
+
+    return { name, mobile, otp: sms.otp, steps: done };
+  },
+
+  'set-clipboard': async ({ text }) => ({ clipboard: await setClipboard(text) }),
+
+  'input-digits': async ({ text, field }) => {
+    if (field) {
+      const el = await findElement(field);
+      await shell(`input tap ${el.x} ${el.y}`);
+      await sleep(300);
     }
-    return { name, mobile, otp: otpRes.otp, movedOn, steps: done };
+    return { digits: await inputDigits(text) };
   },
 };
 
