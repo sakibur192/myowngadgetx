@@ -361,12 +361,13 @@ async function tapSelector(sel, timeout = 15000) {
   return el;
 }
 
-// Type digits straight as key events — works in numeric fields where IME paste doesn't.
-async function inputDigits(text) {
-  const digits = String(text).replace(/[^0-9+*#]/g, '');
-  if (!digits) throw new Error('No digits to type from: ' + text);
-  await shell(`input text ${digits}`);
-  return digits;
+// Type any string as key events (works in numeric fields where IME paste doesn't).
+// No stripping, no data-type checks — whatever is given goes on screen.
+async function inputChars(text) {
+  const t = String(text ?? '');
+  if (!t) return '';
+  await shell(`input text ${escapeForInput(t)}`);
+  return t;
 }
 
 // Put text on Android's clipboard, so an in-app "Paste" button can read it.
@@ -599,8 +600,8 @@ const actions = {
   },
 
   // Coordinate-based registration: taps fixed (x,y) on each page. Logs every step.
+  // No type checking — name and mobile are taken as-is, any string. Never reopens the app.
   register: async ({ name, mobile, otpTimeout = 120000 }) => {
-    if (!mobile) throw new Error('mobile is required');
     const R = REGISTER;
     const done = [];
     const tap = async (xy, labelStr) => {
@@ -623,14 +624,14 @@ const actions = {
     await tap(R.mobileXY, 'mobile field');
     await sleep(400);
     log('  type mobile:', mobile);
-    await inputDigits(String(mobile));
+    await inputChars(String(mobile ?? ''));
     done.push('mobile entered');
     await tap(R.next2XY, 'Next (2) — requests OTP');
     done.push('OTP requested');
 
-    // Wait for the forwarded SMS and use the WHOLE message (no regex)
+    // Wait for a freshly-forwarded SMS (any number) and use the WHOLE message (no regex)
     log('  waiting for forwarded SMS…');
-    const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000) });
+    const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000), lookbackMs: 2000 });
     const code = String(sms.message).trim();
     log('  SMS received -> clipboard:', JSON.stringify(code));
     await setClipboard(code);
@@ -649,13 +650,13 @@ const actions = {
 
   'set-clipboard': async ({ text }) => ({ clipboard: await setClipboard(text) }),
 
-  'input-digits': async ({ text, field }) => {
+  'input-chars': async ({ text, field }) => {
     if (field) {
       const el = await findElement(field);
       await shell(`input tap ${el.x} ${el.y}`);
       await sleep(300);
     }
-    return { digits: await inputDigits(text) };
+    return { typed: await inputChars(text) };
   },
 };
 
@@ -752,7 +753,13 @@ app.post('/api/sms', (req, res) => {
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
   log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
-  res.json({ ok: true, otp: sms.otp, used: sms.used });
+  // Every SMS, from any number, is copied whole onto the device clipboard immediately,
+  // so the app's Paste button always has the latest message ready.
+  const whole = String(sms.message).trim();
+  setClipboard(whole)
+    .then(() => log('  clipboard <- ' + JSON.stringify(whole)))
+    .catch((e) => log('  clipboard set failed: ' + e.message));
+  res.json({ ok: true, copied: whole });
 });
 
 app.get('/api/sms', (req, res) => {
