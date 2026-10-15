@@ -37,17 +37,19 @@ const OTP_SENDER = '01750006696';
 // Your app's registration screen. Adjust the selectors to match your app.
 // Find the real id / text of each field with:  GET /api/ui
 // A selector can be { id: 'etName' } or { text: 'Full name' } or { contains: true, text: 'name' }.
-// Registration is a multi-page wizard. Selectors captured from GET /api/ui:
-//   name page  -> name field, Next
-//   mobile page-> mobile field (numeric), Next  (tapping Next sends the OTP)
-//   otp page   -> app's "Paste" button (reads clipboard), Confirm
+// Registration taps fixed screen coordinates (x,y) captured from GET /api/ui on THIS
+// device. If you move to a screen of a different size, recapture and update these.
+//   page 1: name field -> paste name -> Next
+//   page 2: mobile field -> type digits -> Next (this sends the OTP)
+//   page 3: Paste button (reads clipboard) -> Confirm
 const REGISTER = {
-  restartFirst:  true,                          // relaunch the app fresh before registering (needs DEFAULT_PACKAGE)
-  nameField:     { id: 'name_input_view' },     // page 1 name input (accepts pasted text)
-  mobileField:   { id: 'mobile_input_view' },   // page 2 number input (digits injected)
-  nextButton:    { id: 'progress_btn' },        // the Next button, same id on every page
-  otpPasteButton:{ text: 'Paste' },             // page 3: your button that pastes OTP from the clipboard
-  confirmButton: { id: 'button1' },             // page 3: the Confirm button
+  nameXY:    [582, 721],    // name input
+  next1XY:   [540, 1102],   // Next on page 1
+  mobileXY:  [540, 934],    // mobile input
+  next2XY:   [540, 1366],   // Next on page 2 (requests OTP)
+  pasteXY:   [540, 1395],   // the app's Paste button on the OTP page
+  confirmXY: [814, 1592],   // the Confirm button
+  pageWaitMs: 1800,         // pause after each page change
 };
 
 // Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
@@ -57,6 +59,11 @@ const OTP_AUTO_SUBMIT = null;          // e.g. 'ENTER' or { text: 'Verify' }; nu
 // ================================================================
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Timestamped logging so the pm2 log shows everything that happens.
+function log(...a) {
+  try { console.log(new Date().toISOString().slice(11, 23), ...a); } catch (e) {}
+}
 
 // ---------------------------- ADB core ----------------------------
 function execAdb(args, { binary = false, timeout = 30000 } = {}) {
@@ -110,7 +117,12 @@ async function adb(args, opts) {
     return execAdb(['-s', DEVICE, ...args], opts);
   }
 }
-const shell = (cmd, opts) => adb(['shell', cmd], opts);
+// Log every device command except the noisy polling ones (screenshot, ui dump, status).
+const NOISY = /screencap|uiautomator|dumpsys window|getprop sys\.boot|settings get secure|pm list packages/;
+function shell(cmd, opts) {
+  if (!NOISY.test(cmd)) log('adb >', cmd.length > 140 ? cmd.slice(0, 140) + '…' : cmd);
+  return adb(['shell', cmd], opts);
+}
 const screenshot = () => adb(['exec-out', 'screencap -p'], { binary: true });
 
 // One automation job at a time, so steps from two requests never interleave
@@ -386,7 +398,7 @@ function extractOtp(message) {
 }
 
 function smsMatches(s, f) {
-  if (!s.otp || s.used) return false;
+  if (s.used) return false;
   if (f.from && !s.from.toLowerCase().includes(String(f.from).toLowerCase())) return false;
   if (f.contains && !s.message.toLowerCase().includes(String(f.contains).toLowerCase())) return false;
   return true;
@@ -586,48 +598,53 @@ const actions = {
     return { keyboard: 'ready' };
   },
 
-  // Multi-page registration: name -> Next -> mobile -> Next -> wait OTP -> clipboard+Paste -> Confirm
-  register: async ({ name, mobile, package: p, restart = REGISTER.restartFirst, otpTimeout = 120000 }) => {
+  // Coordinate-based registration: taps fixed (x,y) on each page. Logs every step.
+  register: async ({ name, mobile, otpTimeout = 120000 }) => {
     if (!mobile) throw new Error('mobile is required');
+    const R = REGISTER;
     const done = [];
-    const hasPkg = !!(p || DEFAULT_PACKAGE);
-    if (restart && hasPkg) {
-      await actions.restart({ package: p });
-      await sleep(3000);
-      done.push('app restarted');
-    }
+    const tap = async (xy, labelStr) => {
+      log('  tap', labelStr, '(' + xy[0] + ',' + xy[1] + ')');
+      await shell(`input tap ${xy[0]} ${xy[1]}`);
+    };
+
+    log('REGISTER start name=' + JSON.stringify(name) + ' mobile=' + mobile);
 
     // Page 1 — name
-    const nameEl = await findElement({ ...REGISTER.nameField, timeout: 20000 });
-    await shell(`input tap ${nameEl.x} ${nameEl.y}`);
-    await sleep(300);
+    await tap(R.nameXY, 'name field');
+    await sleep(400);
+    log('  paste name:', name);
     await insertText(name || '');
     done.push('name entered');
-    await tapSelector(REGISTER.nextButton);
-    done.push('Next (page 1)');
+    await tap(R.next1XY, 'Next (1)');
+    await sleep(R.pageWaitMs);
 
-    // Page 2 — mobile (wait for the field to appear, then inject digits)
-    const mobileEl = await findElement({ ...REGISTER.mobileField, timeout: 20000 });
-    await shell(`input tap ${mobileEl.x} ${mobileEl.y}`);
-    await sleep(300);
+    // Page 2 — mobile (digits injected as key events)
+    await tap(R.mobileXY, 'mobile field');
+    await sleep(400);
+    log('  type mobile:', mobile);
     await inputDigits(String(mobile));
     done.push('mobile entered');
-    await tapSelector(REGISTER.nextButton);        // this requests the OTP
-    done.push('Next (page 2) — OTP requested');
+    await tap(R.next2XY, 'Next (2) — requests OTP');
+    done.push('OTP requested');
 
-    // Wait for the OTP SMS forwarded from the SIM phone
-    const sms = await waitForSms({ from: OTP_SENDER, timeout: num(otpTimeout, 'otpTimeout', 600000) });
-    done.push('OTP received: ' + sms.otp);
+    // Wait for the forwarded SMS and use the WHOLE message (no regex)
+    log('  waiting for forwarded SMS…');
+    const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000) });
+    const code = String(sms.message).trim();
+    log('  SMS received -> clipboard:', JSON.stringify(code));
+    await setClipboard(code);
+    done.push('SMS on clipboard');
+    await sleep(R.pageWaitMs);
 
-    // Page 3 — put OTP on clipboard, tap the app's Paste button, then Confirm
-    await setClipboard(sms.otp);
-    await tapSelector(REGISTER.otpPasteButton, 20000);
-    done.push('Paste tapped');
-    await sleep(600);
-    await tapSelector(REGISTER.confirmButton, 10000);
-    done.push('Confirm tapped');
+    // Page 3 — tap the app's Paste button, then Confirm
+    await tap(R.pasteXY, 'Paste button');
+    await sleep(700);
+    await tap(R.confirmXY, 'Confirm');
+    done.push('confirmed');
 
-    return { name, mobile, otp: sms.otp, steps: done };
+    log('REGISTER done:', JSON.stringify(done));
+    return { name, mobile, sms: sms.message, steps: done };
   },
 
   'set-clipboard': async ({ text }) => ({ clipboard: await setClipboard(text) }),
@@ -646,6 +663,15 @@ const actions = {
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Log every request coming in and its response going out (skip the screenshot polling).
+app.use((req, res, next) => {
+  if (req.path === '/api/screenshot') return next();
+  const t = Date.now();
+  log('→', req.method, req.path);
+  res.on('finish', () => log('←', res.statusCode, req.path, Date.now() - t + 'ms'));
+  next();
+});
 
 function auth(req, res, next) {
   const key = String(req.get('x-api-key') || req.query.key || '');
@@ -725,7 +751,7 @@ app.post('/api/sms', (req, res) => {
   const from = b.from ?? b.sender ?? b.phone ?? b.number ?? '';
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
-  console.log(`[sms] from=${sms.from || '?'} otp=${sms.otp || '-'}`);
+  log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
   res.json({ ok: true, otp: sms.otp, used: sms.used });
 });
 
