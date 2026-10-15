@@ -1,0 +1,12 @@
+{
+  "name": "redroid-control",
+  "version": "1.0.0",
+  "description": "Control a Redroid Android container over ADB: taps, typing, OTP from SMS, screenshots",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
