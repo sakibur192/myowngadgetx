@@ -886,15 +886,15 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: the incoming OTP SMS is already on the phone's clipboard. Long-press the OTP
-  // field, paste it, then tap the final Confirm button. Nothing is typed.
+  // Step 3: same shape as the mobile step — tap the OTP field, then fill it. The OTP SMS
+  // is already on the phone's clipboard, so we paste it (KEYCODE_PASTE) instead of typing,
+  // then tap the final Confirm button.
   'reg-otp': async () => {
-    const [x, y] = REGISTER.otpXY;
-    log('STEP otp: long-press (' + x + ',' + y + ') + paste from clipboard');
-    await shell(`input swipe ${x} ${y} ${x} ${y} 800`);   // long-press -> focus + Paste menu
-    await sleep(700);
-    await shell('input keyevent 279');                    // KEYCODE_PASTE
-    await sleep(500);
+    log('STEP otp: tap field + paste from clipboard');
+    await tapXY(REGISTER.otpXY, 'OTP field');
+    await sleep(400);
+    await shell('input keyevent 279');                    // KEYCODE_PASTE (clipboard = the OTP SMS)
+    await sleep(400);
     if (REGISTER.otpNextXY) {
       await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
     }
@@ -1121,7 +1121,7 @@ html,body{margin:0;min-height:100%}
 body{background:var(--desk);color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.wrap{max-width:1040px;margin:0 auto;padding:26px 18px 48px;display:grid;grid-template-columns:auto minmax(290px,1fr);gap:36px;align-items:start}
+.wrap{max-width:560px;margin:0 auto;padding:26px 18px 48px;display:block}
 @media(max-width:760px){.wrap{grid-template-columns:1fr;justify-items:center}}
 
 /* ---- phone ---- */
@@ -1166,26 +1166,16 @@ textarea{resize:vertical;min-height:52px}
 .log-ok{color:var(--ok)}.log-err{color:var(--err)}
 </style></head><body>
 <div class="wrap">
-  <div class="stage">
-    <div class="where" id="where">&mdash;</div>
-    <div class="phone">
-      <div class="screen-hold">
-        <img id="screen" alt="Live Android screen">
-        <div id="veil">Enter your API key to connect</div>
-      </div>
-      <div class="navbar">
-        <button class="navkey back" title="Back" onclick="key('BACK')"><svg viewBox="0 0 24 24"><polygon points="15,5 7,12 15,19"/></svg></button>
-        <button class="navkey" title="Home" onclick="key('HOME')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg></button>
-        <button class="navkey" title="Recent apps" onclick="key('APP_SWITCH')"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></svg></button>
-      </div>
-    </div>
-    <div class="inline" style="width:270px">
-      <button class="btn grow" onclick="refresh()">Refresh</button>
-      <label class="btn grow" style="display:flex;gap:7px;align-items:center;justify-content:center;cursor:pointer"><input type="checkbox" id="auto" checked style="width:auto">Live</label>
-    </div>
-  </div>
-
   <div class="panel">
+    <div class="card">
+      <h2>Device navigation</h2>
+      <div class="where" id="where" style="margin-bottom:10px">&mdash;</div>
+      <div class="inline">
+        <button class="btn grow" onclick="key('BACK')">&larr; Back</button>
+        <button class="btn grow" onclick="key('HOME')">Home</button>
+        <button class="btn grow" onclick="key('APP_SWITCH')">Recents</button>
+      </div>
+    </div>
     <div class="card">
       <h2>Connection</h2>
       <div class="key-row">
@@ -1267,7 +1257,7 @@ textarea{resize:vertical;min-height:52px}
 <script>
 const $=id=>document.getElementById(id);
 let K=localStorage.getItem('rk')||'${API_KEY}';$('key').value=K;
-function saveKey(){K=$('key').value.trim();localStorage.setItem('rk',K);$('veil').classList.toggle('hide',!!K);refresh();status();loadApps();}
+function saveKey(){K=$('key').value.trim();localStorage.setItem('rk',K);status();loadApps();}
 function log(m,cls){const l=$('log');const s=document.createElement('div');if(cls)s.className=cls;s.textContent=new Date().toLocaleTimeString()+'  '+m;l.prepend(s);while(l.childElementCount>60)l.lastChild.remove();}
 async function call(a,b){
   if(!K){log('connect first','log-err');return;}
@@ -1275,18 +1265,8 @@ async function call(a,b){
     const r=await fetch('/api/'+a,{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify(b||{})});
     const j=await r.json();
     log(a+' '+(j.ok?'ok '+JSON.stringify(j.result):'ERROR '+j.error),j.ok?'log-ok':'log-err');
-    setTimeout(refresh,300);return j;
+    setTimeout(status,300);return j;
   }catch(e){log(a+' ERROR '+e.message,'log-err');}
-}
-let loading=false;
-async function refresh(){
-  if(loading||!K)return;loading=true;
-  try{
-    const r=await fetch('/api/screenshot',{headers:{'x-api-key':K}});
-    if(!r.ok)return;
-    const u=URL.createObjectURL(await r.blob());const old=$('screen').src;$('screen').src=u;$('veil').classList.add('hide');
-    if(old.startsWith('blob:'))URL.revokeObjectURL(old);
-  }catch(e){}finally{loading=false;}
 }
 async function status(){
   if(!K)return;
@@ -1309,14 +1289,6 @@ async function loadApps(){
     for(const p of j.apps){const o=document.createElement('option');o.value=p;o.textContent=p;if(p===saved)o.selected=true;sel.appendChild(o);}
   }catch(e){}
 }
-const sc=$('screen');let down=null;
-function pt(e){const r=sc.getBoundingClientRect();const w=sc.naturalWidth||${SCREEN_W},h=sc.naturalHeight||${SCREEN_H};return{x:Math.round((e.clientX-r.left)*w/r.width),y:Math.round((e.clientY-r.top)*h/r.height),t:Date.now()};}
-sc.addEventListener('mousedown',e=>{e.preventDefault();down=pt(e);});
-sc.addEventListener('mouseup',e=>{
-  if(!down)return;const u=pt(e),d=down;down=null;
-  if(Math.hypot(u.x-d.x,u.y-d.y)<15){u.t-d.t>600?call('longpress',{x:d.x,y:d.y}):call('tap',{x:d.x,y:d.y});}
-  else call('swipe',{x1:d.x,y1:d.y,x2:u.x,y2:u.y,ms:Math.max(100,Math.min(1500,u.t-d.t))});
-});
 function key(k){call('key',{key:k});}
 function sendText(){const t=$('text').value;if(t==='')return;call('paste',{text:t});}
 function sendOtp(){const v=$('otp').value.trim();if(!v)return;call('otp',/^\\d{4,8}$/.test(v)?{code:v}:{message:v});}
@@ -1329,10 +1301,9 @@ const KPAD=${JSON.stringify(KEYPAD)};
 const TAPLABELS={mobileXY:'Mobile field',nextMobileXY:'Next (mobile)',pinXY:'PIN field',nextPinXY:'Next (pin)',otpXY:'OTP field',otpNextXY:'Confirm (otp)'};
 (function(){const box=$('taps');for(const k in TAPLABELS){const xy=COORDS[k];if(!xy)continue;const b=document.createElement('button');b.className='btn';b.textContent=TAPLABELS[k]+' ('+xy[0]+','+xy[1]+')';b.onclick=()=>call('tap',{x:xy[0],y:xy[1]});box.appendChild(b);}})();
 function tapKey(c){const xy=KPAD[c];if(xy)call('tap',{x:xy[0],y:xy[1]});}
-if(K){$('veil').classList.add('hide');loadApps();}
-setInterval(()=>{if($('auto').checked&&!document.hidden)refresh();},1500);
+if(K){loadApps();}
 setInterval(status,2500);
-refresh();status();
+status();
 </script></body></html>`;
 
 // ---------------------------- /flow wizard ----------------------------
