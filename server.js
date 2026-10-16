@@ -48,6 +48,7 @@ const REGISTER = {
   mobileXY:     [540, 934],    // mobile number field                     (verify)
   nextMobileXY: [540, 1366],   // Next button after the mobile number      (verify)
   nextPinXY:    [540, 1366],   // Next button after the 4-digit PIN         (CHANGE)
+  otpNextXY:    null,          // optional Next/Confirm after the OTP, e.g. [540,1366]  (set if needed)
   pageWaitMs:   1800,          // pause after each page change
 };
 
@@ -713,9 +714,14 @@ const actions = {
     return { step: 'pin', pin: typed, armed: true };
   },
 
-  // Step 3 (manual fallback): type the OTP digits on the keypad, then DONE.
+  // Step 3: type the OTP digits on the keypad, tap DONE, then optional Next/Confirm.
   'reg-otp': async ({ code }) => {
-    const otp = await tapPad(code, { submit: true });
+    log('STEP otp=' + code);
+    const otp = await tapPad(code, { submit: true });   // digits + DONE
+    if (REGISTER.otpNextXY) {
+      await sleep(500);
+      await tapXY(REGISTER.otpNextXY, 'Next (otp)');
+    }
     return { step: 'otp', otp };
   },
 
