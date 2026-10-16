@@ -65,9 +65,6 @@ const KEYPAD = {
 const PIN = '1234';
 
 // Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
-const AUTO_TYPE_SMS_OTP_UNUSED = false;
-
-// Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
 const AUTO_TYPE_SMS_OTP = false;
 const OTP_FIELD = null;                // e.g. { id: 'otpInput' } or { text: 'Enter OTP' }; null = currently focused field
 const OTP_AUTO_SUBMIT = null;          // e.g. 'ENTER' or { text: 'Verify' }; null = don't submit
@@ -765,6 +762,7 @@ function auth(req, res, next) {
 }
 
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
+app.get('/flow', (req, res) => res.type('html').send(FLOW_HTML));
 app.use('/api', auth);
 
 app.get('/api/status', async (req, res) => {
@@ -1129,6 +1127,100 @@ if(K){$('veil').classList.add('hide');loadApps();}
 setInterval(()=>{if($('auto').checked&&!document.hidden)refresh();},1500);
 setInterval(status,2500);
 refresh();status();
+</script></body></html>`;
+
+// ---------------------------- /flow wizard ----------------------------
+const FLOW_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GadgetX Flow</title>
+<style>
+:root{--bg:#0f1419;--card:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--err:#e06b5c;--field:#0f151b}
+@media(prefers-color-scheme:light){:root{--bg:#eef1f4;--card:#fff;--ink:#1a2129;--muted:#5c6872;--line:#d6dce2;--accent:#1f5fbf;--ok:#1e7f4f;--err:#b23a2c;--field:#fff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+.wrap{max-width:460px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+.card.done{opacity:.6}.card.locked{opacity:.4;pointer-events:none}
+.step{font-size:12px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-bottom:8px}
+input{width:100%;background:var(--field);border:1px solid var(--line);border-radius:9px;padding:11px;color:inherit;font:inherit;margin-bottom:10px}
+button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:12px;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.msg{font-size:13px;margin-top:8px;min-height:18px;white-space:pre-wrap;word-break:break-word}
+.ok{color:var(--ok)}.err{color:var(--err)}
+#shot{width:100%;border:1px solid var(--line);border-radius:12px;margin-top:8px;display:none}
+</style></head><body>
+<div class="wrap">
+  <h1>GadgetX Flow</h1>
+  <p class="sub">One step at a time. Each unlocks after the one before it succeeds.</p>
+
+  <div class="card" id="c0">
+    <div class="step">Connect</div>
+    <input id="key" type="password" placeholder="API key" autocomplete="off">
+    <button onclick="connect()">Connect</button>
+    <div class="msg" id="m0"></div>
+  </div>
+
+  <div class="card locked" id="c1">
+    <div class="step">Step 1 — Mobile</div>
+    <input id="mobile" type="text" placeholder="Mobile number" inputmode="numeric">
+    <button id="b1" onclick="doStep(1,'/api/reg-mobile',()=>({mobile:v('mobile')}))">Mobile &rarr; Next</button>
+    <div class="msg" id="m1"></div>
+  </div>
+
+  <div class="card locked" id="c2">
+    <div class="step">Step 2 — PIN</div>
+    <input id="pin" type="text" placeholder="4-digit PIN" inputmode="numeric" maxlength="8">
+    <button id="b2" onclick="doStep(2,'/api/reg-pin',()=>({pin:v('pin')}))">PIN &rarr; Next</button>
+    <div class="msg" id="m2"></div>
+  </div>
+
+  <div class="card locked" id="c3">
+    <div class="step">Step 3 — OTP</div>
+    <input id="otp" type="text" placeholder="Paste the OTP code" inputmode="numeric">
+    <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({code:v('otp')}))">Submit OTP</button>
+    <div class="msg" id="m3"></div>
+    <img id="shot" alt="current screen">
+  </div>
+</div>
+<script>
+var K='';
+function $(i){return document.getElementById(i)}
+function v(i){return $(i).value.trim()}
+function unlock(n){$('c'+n).classList.remove('locked')}
+function lock(n){$('c'+n).classList.add('locked')}
+async function connect(){
+  K=v('key');if(!K){$('m0').textContent='Enter the key';return}
+  try{
+    const r=await fetch('/api/status',{headers:{'x-api-key':K}});
+    const j=await r.json();
+    if(!j.ok){$('m0').innerHTML='<span class=err>'+ (j.error||'bad key') +'</span>';return}
+    $('m0').innerHTML='<span class=ok>Connected'+(j.screen&&j.screen.name?(' — on '+j.screen.name):'')+'</span>';
+    $('c0').classList.add('done');unlock(1);$('mobile').focus();
+  }catch(e){$('m0').innerHTML='<span class=err>'+e.message+'</span>'}
+}
+async function doStep(n,path,body){
+  const btn=$('b'+n),m=$('m'+n);
+  btn.disabled=true;m.textContent='Working…';
+  try{
+    const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify(body())});
+    const j=await r.json();
+    if(j.ok){
+      m.innerHTML='<span class=ok>&#10003; '+JSON.stringify(j.result)+'</span>';
+      $('c'+n).classList.add('done');
+      if(n<3){unlock(n+1);}
+      else{await showScreen();}
+    }else{
+      m.innerHTML='<span class=err>&#10007; '+(j.error||'failed')+'</span>';btn.disabled=false;
+    }
+  }catch(e){m.innerHTML='<span class=err>'+e.message+'</span>';btn.disabled=false;}
+}
+async function showScreen(){
+  try{
+    const r=await fetch('/api/screenshot',{headers:{'x-api-key':K}});
+    if(!r.ok)return;
+    const img=$('shot');img.src=URL.createObjectURL(await r.blob());img.style.display='block';
+  }catch(e){}
+}
 </script></body></html>`;
 
 // ---------------------------- start ----------------------------
