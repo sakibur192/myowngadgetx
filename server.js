@@ -676,9 +676,9 @@ const actions = {
     await sleep(R.pageWaitMs);
 
     await tapXY(R.pinXY, 'PIN field');
-    await sleep(400);
-    log('  type PIN:', pin);
-    await inputChars(String(pin ?? ''));
+    await sleep(500);
+    log('  tap PIN on keypad:', pin);
+    await tapPad(String(pin));
     done.push('pin entered');
     await tapXY(R.nextPinXY, 'Next (pin)');
     done.push('OTP requested');
@@ -686,11 +686,11 @@ const actions = {
     log('  waiting for forwarded SMS…');
     const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000), lookbackMs: 2000 });
     const otp = digitsOnly(sms.message);
-    log('  type OTP:', otp);
+    log('  tap OTP on keypad:', otp);
     await sleep(R.pageWaitMs);
     await tapXY(R.otpXY, 'OTP field');
-    await sleep(400);
-    await inputChars(otp);
+    await sleep(500);
+    await tapPad(otp);
     if (R.otpNextXY) { await sleep(400); await tapXY(R.otpNextXY, 'Confirm (otp)'); }
     done.push('OTP ' + otp + ' entered');
 
@@ -709,22 +709,22 @@ const actions = {
     return { step: 'mobile', mobile: String(mobile ?? '') };
   },
 
-  // Step 2: tap the PIN field, type the PIN, tap Next.
+  // Step 2: tap the PIN field (shows keypad), tap each PIN digit on the keypad, tap Next.
   'reg-pin': async ({ pin = PIN }) => {
     log('STEP pin=' + pin);
     await tapXY(REGISTER.pinXY, 'PIN field');
-    await sleep(400);
-    await inputChars(String(pin ?? ''));
+    await sleep(500);
+    const typed = await tapPad(String(pin));      // taps the digits on the on-screen keypad
     await tapXY(REGISTER.nextPinXY, 'Next (pin)');
-    return { step: 'pin', pin: String(pin ?? '') };
+    return { step: 'pin', pin: typed };
   },
 
-  // Step 3: tap the OTP field, type the OTP, tap Confirm/Next.
+  // Step 3: tap the OTP field (shows keypad), tap each OTP digit on the keypad, tap Confirm.
   'reg-otp': async ({ code }) => {
     log('STEP otp=' + code);
     await tapXY(REGISTER.otpXY, 'OTP field');
-    await sleep(400);
-    const otp = await inputChars(String(code ?? ''));
+    await sleep(500);
+    const otp = await tapPad(String(code));       // taps the digits on the on-screen keypad
     if (REGISTER.otpNextXY) {
       await sleep(400);
       await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
