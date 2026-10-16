@@ -50,8 +50,8 @@ const REGISTER = {
   nextMobileXY: [540, 1102],   // Next (mobile)  = old NAME Next position
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
   nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
-  otpXY:        [247, 1145],   // OTP field — long-press here, then paste the SMS from clipboard
-  otpNextXY:    [814, 1592],   // Confirm on the OTP page   (CHANGE: grab the real one on /tapsfinder)
+  otpXY:        [247, 1145],   // OTP field — tap here, then type the OTP/SMS text
+  otpNextXY:    [794, 1741],   // Confirm on the OTP page   (measured on the real phone)
   pageWaitMs:   1800,          // pause after each page change
 };
 
