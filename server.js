@@ -14,7 +14,7 @@ const https = require('https');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
 // ============================ CONFIG ============================
 const PORT = 3900;
@@ -139,6 +139,159 @@ function shell(cmd, opts) {
   return adb(['shell', cmd], opts);
 }
 const screenshot = () => adb(['exec-out', 'screencap -p'], { binary: true });
+
+// ---------------------------- live touch capture (tap the REAL phone) ----------------------------
+// Reads the phone's touchscreen with `getevent`, so whenever you physically tap the device
+// the (x,y) in screen pixels is captured and served to /tapsfinder. No screenshot needed.
+const touch = {
+  dev: '',            // /dev/input/eventX of the touchscreen
+  maxX: 0, maxY: 0,   // raw digitizer range
+  dispW: 0, dispH: 0, // display size in px (what `input tap` uses)
+  taps: [],           // { id, x, y, rawX, rawY, t }
+  seq: 0,
+  proc: null,
+  running: false,
+  error: '',
+  startedAt: 0,
+};
+
+function parseWmSize(out) {
+  // Prefer "Override size:" then "Physical size:"
+  const over = /Override size:\s*(\d+)x(\d+)/.exec(out);
+  const phys = /Physical size:\s*(\d+)x(\d+)/.exec(out);
+  const m = over || phys;
+  return m ? { w: +m[1], h: +m[2] } : null;
+}
+
+// Find the touchscreen input device and its raw coordinate range.
+async function detectTouch() {
+  const lp = await adb(['shell', 'getevent', '-lp']);
+  const blocks = lp.split(/add device \d+:\s*/).slice(1);
+  let best = null;
+  for (const b of blocks) {
+    const path = (b.match(/^(\/dev\/input\/event\d+)/) || [])[1];
+    if (!path) continue;
+    const mtx = /ABS_MT_POSITION_X[^\n]*max\s+(\d+)/.exec(b);
+    const mty = /ABS_MT_POSITION_Y[^\n]*max\s+(\d+)/.exec(b);
+    const ax = /ABS_X[^\n]*max\s+(\d+)/.exec(b);
+    const ay = /ABS_Y[^\n]*max\s+(\d+)/.exec(b);
+    if (mtx && mty) { best = { path, maxX: +mtx[1], maxY: +mty[1], mt: true }; break; }
+    if (!best && ax && ay) best = { path, maxX: +ax[1], maxY: +ay[1], mt: false };
+  }
+  if (!best) throw new Error('No touchscreen input device found in `getevent -lp`');
+
+  let disp = null;
+  try { disp = parseWmSize(await shell('wm size')); } catch (_) {}
+  touch.dev = best.path;
+  touch.maxX = best.maxX;
+  touch.maxY = best.maxY;
+  touch.dispW = disp ? disp.w : (best.maxX + 1);
+  touch.dispH = disp ? disp.h : (best.maxY + 1);
+  log(`[touch] device=${touch.dev} raw=${touch.maxX}x${touch.maxY} display=${touch.dispW}x${touch.dispH}`);
+}
+
+function scaleTap(rawX, rawY) {
+  const x = Math.round(rawX * touch.dispW / (touch.maxX || touch.dispW));
+  const y = Math.round(rawY * touch.dispH / (touch.maxY || touch.dispH));
+  return {
+    x: Math.max(0, Math.min(touch.dispW, x)),
+    y: Math.max(0, Math.min(touch.dispH, y)),
+  };
+}
+
+function pushTap(rawX, rawY) {
+  const s = scaleTap(rawX, rawY);
+  const t = { id: ++touch.seq, x: s.x, y: s.y, rawX, rawY, t: Date.now() };
+  touch.taps.push(t);
+  if (touch.taps.length > 500) touch.taps.splice(0, touch.taps.length - 500);
+  log(`[touch] tap @ ${s.x},${s.y}  (raw ${rawX},${rawY})`);
+}
+
+// Stream getevent and emit one tap per finger-up, at the last known position.
+function startTouchStream() {
+  if (touch.proc) return;
+  const args = ['-s', DEVICE, 'shell', 'getevent', '-l', touch.dev];
+  const p = spawn(ADB, args);
+  touch.proc = p;
+  touch.running = true;
+  touch.startedAt = Date.now();
+
+  let buf = '';
+  let lastX = null, lastY = null;   // most recent coords during the current touch
+  let downX = null, downY = null;   // coords captured at finger-down
+  let touching = false;
+
+  const liftFinger = () => {
+    if (lastX != null && lastY != null) pushTap(lastX, lastY);
+    touching = false; lastX = lastY = null;
+  };
+  const onLine = (line) => {
+    // getevent -l lines, e.g.:
+    //   "EV_ABS       ABS_MT_POSITION_X    000003c5"   (value is hex)
+    //   "EV_KEY       BTN_TOUCH            DOWN"        (value is symbolic)
+    const m = /EV_\w+\s+(\w+)\s+(\S+)/.exec(line);
+    if (!m) return;
+    const code = m[1];
+    const raw = m[2];
+    const isHex = /^[0-9a-fA-F]+$/.test(raw);
+    const num = isHex ? parseInt(raw, 16) : NaN;
+    switch (code) {
+      case 'ABS_MT_POSITION_X':
+      case 'ABS_X':
+        lastX = num; touching = true; break;
+      case 'ABS_MT_POSITION_Y':
+      case 'ABS_Y':
+        lastY = num; break;
+      case 'ABS_MT_TRACKING_ID':
+        if (num === 0xffffffff) liftFinger();   // finger up (type B multitouch)
+        else touching = true;
+        break;
+      case 'BTN_TOUCH':
+        if (raw === 'UP' || num === 0) liftFinger();       // finger up (symbolic or hex)
+        else { touching = true; downX = lastX; downY = lastY; }
+        break;
+    }
+  };
+
+  p.stdout.on('data', (d) => {
+    buf += d.toString();
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      try { onLine(line); } catch (_) {}
+    }
+  });
+  p.stderr.on('data', (d) => { const s = d.toString().trim(); if (s) touch.error = s; });
+  const done = (why) => {
+    if (touch.proc === p) { touch.proc = null; touch.running = false; }
+    log('[touch] getevent stream ended: ' + why);
+  };
+  p.on('error', (e) => { touch.error = e.message; done(e.message); });
+  p.on('close', (c) => done('exit ' + c));
+}
+
+let touchInit = null;
+// Make sure detection + streaming are up. Safe to call repeatedly.
+function ensureTouch(force = false) {
+  if (force) {
+    try { touch.proc && touch.proc.kill(); } catch (_) {}
+    touch.proc = null; touch.running = false; touchInit = null;
+  }
+  if (touch.running && touch.dev) return Promise.resolve();
+  if (!touchInit) {
+    touchInit = (async () => {
+      if (!touch.dev || force) await detectTouch();
+      startTouchStream();
+      touch.error = '';
+    })().catch((e) => { touch.error = e.message; throw e; })
+      .finally(() => { touchInit = null; });
+  }
+  return touchInit;
+}
+
+// Keep the stream alive while the device is connected.
+setInterval(() => { if (touch.dev && !touch.running) ensureTouch().catch(() => {}); }, 4000);
 
 // One automation job at a time, so steps from two requests never interleave
 let jobChain = Promise.resolve();
@@ -824,6 +977,32 @@ app.get('/api/screenshot', async (req, res) => {
   }
 });
 
+// Live taps captured from the REAL phone's touchscreen (for /tapsfinder).
+app.get('/api/taps', async (req, res) => {
+  try { await ensureTouch(); } catch (_) {}
+  const since = Number(req.query.since) || 0;
+  const taps = touch.taps.filter((t) => t.id > since);
+  res.json({
+    ok: touch.running,
+    connected: touch.running,
+    device: touch.dev,
+    display: { w: touch.dispW, h: touch.dispH },
+    raw: { x: touch.maxX, y: touch.maxY },
+    error: touch.error || '',
+    last: touch.seq,
+    taps,
+  });
+});
+
+// Force re-detect the touchscreen / restart the stream (after reconnecting the phone).
+app.post('/api/taps/redetect', async (req, res) => {
+  try { await ensureTouch(true); res.json({ ok: true, device: touch.dev, display: { w: touch.dispW, h: touch.dispH } }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Clear the server-side tap buffer.
+app.post('/api/taps/clear', (req, res) => { touch.taps = []; res.json({ ok: true }); });
+
 app.get('/api/ui', async (req, res) => {
   try {
     let nodes = await dumpUi();
@@ -1235,106 +1414,91 @@ const FINDER_HTML = `<!doctype html>
 <title>Taps Finder</title>
 <style>
 :root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--bad:#e5534b}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;display:flex;gap:14px;padding:14px;flex-wrap:wrap;align-items:flex-start}
-/* fixed-size screen box like the dashboard, so there's always something to hover/click */
-.stage{position:relative;width:360px;max-width:92vw;aspect-ratio:${SCREEN_W}/${SCREEN_H};border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#000;cursor:crosshair;flex:0 0 auto}
-#screen{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:block;user-select:none;-webkit-user-drag:none}
-#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:16px;color:var(--muted);font-size:13px;pointer-events:none}
-#hline,#vline{position:absolute;background:rgba(47,111,237,.8);pointer-events:none;display:none}
-#hline{left:0;right:0;height:1px}#vline{top:0;bottom:0;width:1px}
-#tag{position:absolute;transform:translate(8px,8px);background:#000c;color:#fff;font:12px monospace;padding:2px 6px;border-radius:5px;pointer-events:none;white-space:nowrap;display:none}
-.panel{flex:1;min-width:260px;display:flex;flex-direction:column;gap:10px}
-h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:0}
-.status{font-size:13px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,sans-serif;display:flex;justify-content:center;padding:18px}
+.wrap{width:100%;max-width:560px;display:flex;flex-direction:column;gap:12px}
+h1{font-size:18px;margin:0}.sub{color:var(--muted);font-size:13px;margin:0}
+.status{font-size:13px;padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:var(--panel)}
 .status.ok{border-color:var(--ok);color:var(--ok)}.status.bad{border-color:var(--bad);color:var(--bad)}
-.big{font:600 24px/1.2 monospace;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;text-align:center}
-label{display:flex;gap:8px;align-items:center;font-size:13px}
-button{background:var(--panel);border:1px solid var(--line);color:inherit;border-radius:8px;padding:8px 10px;cursor:pointer;font:inherit}
+.big{font:700 34px/1.1 monospace;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;text-align:center}
+.big small{display:block;color:var(--muted);font:500 12px system-ui;margin-top:6px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{background:var(--panel);border:1px solid var(--line);color:inherit;border-radius:9px;padding:9px 12px;cursor:pointer;font:inherit}
 button:hover{border-color:var(--accent)}
-#list{list-style:none;margin:0;padding:0;max-height:50vh;overflow:auto}
-#list li{display:flex;justify-content:space-between;gap:8px;font:13px monospace;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 10px;margin-bottom:6px}
-#list .x{cursor:pointer;color:var(--accent)}
+#list{list-style:none;margin:0;padding:0;max-height:55vh;overflow:auto}
+#list li{display:flex;justify-content:space-between;align-items:center;gap:8px;font:14px monospace;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 12px;margin-bottom:7px}
+#list li.new{border-color:var(--ok)}
+#list .n{color:var(--muted);font-size:12px}
+#list .act{display:flex;gap:10px}
+#list .copy,#list .tap{cursor:pointer;color:var(--accent)}
+.empty{color:var(--muted);font-size:13px;text-align:center;padding:18px}
 </style></head><body>
-<div class="stage" id="stage">
-  <img id="screen" alt="">
-  <div id="msg">Loading screen…</div>
-  <div id="hline"></div><div id="vline"></div><div id="tag"></div>
-</div>
-<div class="panel">
+<div class="wrap">
   <h1>Taps Finder</h1>
-  <p class="sub">Move over the screen to read the device X,Y. Click to capture — each capture is copied to your clipboard.</p>
+  <p class="sub">Tap anywhere on the <b>real phone</b> — the X,Y shows up here. No screen preview needed.</p>
   <div class="status" id="status">Connecting…</div>
-  <div class="big" id="cur">—</div>
-  <label><input type="checkbox" id="dotap"> Also TAP the device on click (to verify the spot)</label>
-  <div style="display:flex;gap:8px;flex-wrap:wrap"><button onclick="refresh(true)">Refresh screen</button><button onclick="clearList()">Clear list</button></div>
-  <ul id="list"></ul>
+  <div class="big" id="cur">— , —<small>last tap on the phone</small></div>
+  <div class="row">
+    <button onclick="redetect()">Re-detect phone</button>
+    <button onclick="clearList()">Clear list</button>
+  </div>
+  <ul id="list"><li class="empty" id="empty">No taps yet. Tap the phone screen.</li></ul>
 </div>
 <script>
 const K='${API_KEY}';
-const stage=document.getElementById('stage'),sc=document.getElementById('screen'),msg=document.getElementById('msg'),
-      hl=document.getElementById('hline'),vl=document.getElementById('vline'),tag=document.getElementById('tag'),
-      cur=document.getElementById('cur'),list=document.getElementById('list'),status=document.getElementById('status');
-let haveShot=false;
+const H={'x-api-key':K};
+const cur=document.getElementById('cur'),list=document.getElementById('list'),statusEl=document.getElementById('status');
+let since=0;
 
-function setStatus(t,cls){status.textContent=t;status.className='status'+(cls?' '+cls:'');}
+function setStatus(t,cls){statusEl.textContent=t;statusEl.className='status'+(cls?' '+cls:'');}
+function copy(s){try{navigator.clipboard.writeText(s);}catch(_){}}
 
-// Device X,Y from a mouse event. The screen fills the stage (object-fit:fill),
-// so stage pixels map linearly to the device's real resolution.
-function dev(e){
-  const r=stage.getBoundingClientRect();
-  const w=sc.naturalWidth||${SCREEN_W}, h=sc.naturalHeight||${SCREEN_H};
-  const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
-  const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
-  return{x:Math.round(cx*w/r.width),y:Math.round(cy*h/r.height),cx,cy};
-}
-
-stage.addEventListener('mousemove',e=>{
-  const p=dev(e);
-  hl.style.display=vl.style.display=tag.style.display='block';
-  hl.style.top=p.cy+'px';vl.style.left=p.cx+'px';
-  tag.style.left=p.cx+'px';tag.style.top=p.cy+'px';tag.textContent=p.x+','+p.y;
-  cur.textContent=p.x+' , '+p.y;
-});
-stage.addEventListener('mouseleave',()=>{hl.style.display=vl.style.display=tag.style.display='none';});
-
-stage.addEventListener('click',async e=>{
-  const p=dev(e);const xy='['+p.x+', '+p.y+']';
-  try{await navigator.clipboard.writeText(xy);}catch(_){}
-  const li=document.createElement('li');
-  li.innerHTML='<span>'+xy+'</span><span class=x>tap</span>';
-  li.querySelector('.x').onclick=()=>tapDevice(p.x,p.y);
+function addTap(t){
+  const empty=document.getElementById('empty'); if(empty)empty.remove();
+  const xy='['+t.x+', '+t.y+']';
+  const li=document.createElement('li');li.className='new';
+  li.innerHTML='<span class=xy>'+xy+'</span><span class=act><span class=n>raw '+t.rawX+','+t.rawY+'</span><span class=copy>copy</span><span class=tap>re-tap</span></span>';
+  li.querySelector('.copy').onclick=()=>{copy(xy);li.querySelector('.copy').textContent='copied';setTimeout(()=>li.querySelector('.copy').textContent='copy',900);};
+  li.querySelector('.tap').onclick=()=>retap(t.x,t.y);
   list.prepend(li);
-  if(document.getElementById('dotap').checked)tapDevice(p.x,p.y);
-});
-
-async function tapDevice(x,y){
-  try{await fetch('/api/tap',{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify({x,y})});}catch(_){}
-  setTimeout(()=>refresh(true),350);
+  while(list.childElementCount>200)list.lastChild.remove();
+  cur.innerHTML=t.x+' , '+t.y+'<small>last tap on the phone — copied to clipboard</small>';
+  copy(xy);                          // newest tap is always on the clipboard
+  setTimeout(()=>li.classList.remove('new'),1200);
 }
-function clearList(){list.innerHTML='';}
+
+async function retap(x,y){
+  try{await fetch('/api/tap',{method:'POST',headers:{'content-type':'application/json',...H},body:JSON.stringify({x,y})});}catch(_){}
+}
+function clearList(){
+  list.innerHTML='<li class="empty" id="empty">No taps yet. Tap the phone screen.</li>';
+  fetch('/api/taps/clear',{method:'POST',headers:H}).catch(()=>{});
+}
+async function redetect(){
+  setStatus('Re-detecting touchscreen…');
+  try{const r=await fetch('/api/taps/redetect',{method:'POST',headers:H});const j=await r.json();
+    if(j.ok)setStatus('Re-detected — '+j.device+'  ('+j.display.w+'×'+j.display.h+')','ok');
+    else setStatus('Re-detect failed: '+(j.error||'?'),'bad');}
+  catch(e){setStatus('Re-detect failed: '+(e.message||e),'bad');}
+}
 
 let busy=false;
-async function refresh(force){
+async function poll(){
   if(busy)return;busy=true;
   try{
-    const r=await fetch('/api/screenshot',{headers:{'x-api-key':K},cache:'no-store'});
-    if(r.ok){
-      const u=URL.createObjectURL(await r.blob());const old=sc.src;
-      sc.onload=()=>{haveShot=true;msg.style.display='none';
-        setStatus('Connected — '+(sc.naturalWidth||'?')+' × '+(sc.naturalHeight||'?')+' px. Hover and click the screen.','ok');};
-      sc.src=u;if(old&&old.startsWith('blob:'))URL.revokeObjectURL(old);
+    const r=await fetch('/api/taps?since='+since,{headers:H,cache:'no-store'});
+    const j=await r.json();
+    if(j.connected){
+      setStatus('Listening — '+j.device+'  (display '+j.display.w+'×'+j.display.h+', raw '+j.raw.x+'×'+j.raw.y+'). Tap the phone.','ok');
     }else{
-      let why='';try{const j=await r.json();why=j.error||('HTTP '+r.status);}catch(_){why='HTTP '+r.status;}
-      if(!haveShot){msg.textContent='⚠ No screen';msg.style.display='flex';}
-      setStatus('Device not responding — '+why+'. Reconnect adb, then Refresh.','bad');
+      setStatus('Touch stream not running'+(j.error?' — '+j.error:'')+'. Phone connected? Then Re-detect.','bad');
     }
-  }catch(e){
-    if(!haveShot){msg.textContent='⚠ Can\\'t reach server';msg.style.display='flex';}
-    setStatus('Fetch failed: '+(e.message||e)+'','bad');
-  }finally{busy=false;}
+    if(j.taps&&j.taps.length){ for(const t of j.taps){addTap(t);since=t.id;} }
+    else if(typeof j.last==='number' && j.last>since && !j.taps.length){ since=j.last; }
+  }catch(e){ setStatus('Server unreachable: '+(e.message||e),'bad'); }
+  finally{busy=false;}
 }
-setInterval(()=>{if(!document.hidden)refresh();},1500);
-refresh(true);
+setInterval(()=>{if(!document.hidden)poll();},700);
+poll();
 </script></body></html>`;
 
 // ---------------------------- start ----------------------------
