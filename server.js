@@ -1234,41 +1234,70 @@ const FINDER_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Taps Finder</title>
 <style>
-:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;display:flex;gap:14px;padding:14px;flex-wrap:wrap}
-.stage{position:relative;line-height:0}
-#screen{max-height:92vh;border:1px solid var(--line);border-radius:10px;cursor:crosshair;background:#000;display:block}
-#hline,#vline{position:absolute;background:rgba(47,111,237,.7);pointer-events:none}
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--bad:#e5534b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;display:flex;gap:14px;padding:14px;flex-wrap:wrap;align-items:flex-start}
+/* fixed-size screen box like the dashboard, so there's always something to hover/click */
+.stage{position:relative;width:360px;max-width:92vw;aspect-ratio:${SCREEN_W}/${SCREEN_H};border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#000;cursor:crosshair;flex:0 0 auto}
+#screen{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:block;user-select:none;-webkit-user-drag:none}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:16px;color:var(--muted);font-size:13px;pointer-events:none}
+#hline,#vline{position:absolute;background:rgba(47,111,237,.8);pointer-events:none;display:none}
 #hline{left:0;right:0;height:1px}#vline{top:0;bottom:0;width:1px}
-#tag{position:absolute;transform:translate(8px,8px);background:#000a;color:#fff;font:12px monospace;padding:2px 6px;border-radius:5px;pointer-events:none;white-space:nowrap}
+#tag{position:absolute;transform:translate(8px,8px);background:#000c;color:#fff;font:12px monospace;padding:2px 6px;border-radius:5px;pointer-events:none;white-space:nowrap;display:none}
 .panel{flex:1;min-width:260px;display:flex;flex-direction:column;gap:10px}
 h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:0}
-.big{font:600 22px/1.2 monospace;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;text-align:center}
+.status{font-size:13px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel)}
+.status.ok{border-color:var(--ok);color:var(--ok)}.status.bad{border-color:var(--bad);color:var(--bad)}
+.big{font:600 24px/1.2 monospace;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;text-align:center}
 label{display:flex;gap:8px;align-items:center;font-size:13px}
 button{background:var(--panel);border:1px solid var(--line);color:inherit;border-radius:8px;padding:8px 10px;cursor:pointer;font:inherit}
 button:hover{border-color:var(--accent)}
-#list{list-style:none;margin:0;padding:0;max-height:60vh;overflow:auto}
+#list{list-style:none;margin:0;padding:0;max-height:50vh;overflow:auto}
 #list li{display:flex;justify-content:space-between;gap:8px;font:13px monospace;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 10px;margin-bottom:6px}
 #list .x{cursor:pointer;color:var(--accent)}
 </style></head><body>
-<div class="stage">
-  <img id="screen" alt="screen">
+<div class="stage" id="stage">
+  <img id="screen" alt="">
+  <div id="msg">Loading screen…</div>
   <div id="hline"></div><div id="vline"></div><div id="tag"></div>
 </div>
 <div class="panel">
   <h1>Taps Finder</h1>
-  <p class="sub">Move over the screen to read the device X,Y. Click to capture. Each capture is copied to your clipboard.</p>
+  <p class="sub">Move over the screen to read the device X,Y. Click to capture — each capture is copied to your clipboard.</p>
+  <div class="status" id="status">Connecting…</div>
   <div class="big" id="cur">—</div>
   <label><input type="checkbox" id="dotap"> Also TAP the device on click (to verify the spot)</label>
-  <div style="display:flex;gap:8px"><button onclick="refresh()">Refresh screen</button><button onclick="clearList()">Clear list</button></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap"><button onclick="refresh(true)">Refresh screen</button><button onclick="clearList()">Clear list</button></div>
   <ul id="list"></ul>
 </div>
 <script>
 const K='${API_KEY}';
-const sc=document.getElementById('screen'),hl=document.getElementById('hline'),vl=document.getElementById('vline'),tag=document.getElementById('tag'),cur=document.getElementById('cur'),list=document.getElementById('list');
-function dev(e){const r=sc.getBoundingClientRect();const w=sc.naturalWidth||720,h=sc.naturalHeight||1280;return{x:Math.round((e.clientX-r.left)*w/r.width),y:Math.round((e.clientY-r.top)*h/r.height),cx:e.clientX-r.left,cy:e.clientY-r.top};}
-sc.addEventListener('mousemove',e=>{const p=dev(e);hl.style.top=p.cy+'px';vl.style.left=p.cx+'px';tag.style.left=p.cx+'px';tag.style.top=p.cy+'px';tag.textContent=p.x+','+p.y;cur.textContent=p.x+' , '+p.y;});
-sc.addEventListener('click',async e=>{
+const stage=document.getElementById('stage'),sc=document.getElementById('screen'),msg=document.getElementById('msg'),
+      hl=document.getElementById('hline'),vl=document.getElementById('vline'),tag=document.getElementById('tag'),
+      cur=document.getElementById('cur'),list=document.getElementById('list'),status=document.getElementById('status');
+let haveShot=false;
+
+function setStatus(t,cls){status.textContent=t;status.className='status'+(cls?' '+cls:'');}
+
+// Device X,Y from a mouse event. The screen fills the stage (object-fit:fill),
+// so stage pixels map linearly to the device's real resolution.
+function dev(e){
+  const r=stage.getBoundingClientRect();
+  const w=sc.naturalWidth||${SCREEN_W}, h=sc.naturalHeight||${SCREEN_H};
+  const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
+  const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
+  return{x:Math.round(cx*w/r.width),y:Math.round(cy*h/r.height),cx,cy};
+}
+
+stage.addEventListener('mousemove',e=>{
+  const p=dev(e);
+  hl.style.display=vl.style.display=tag.style.display='block';
+  hl.style.top=p.cy+'px';vl.style.left=p.cx+'px';
+  tag.style.left=p.cx+'px';tag.style.top=p.cy+'px';tag.textContent=p.x+','+p.y;
+  cur.textContent=p.x+' , '+p.y;
+});
+stage.addEventListener('mouseleave',()=>{hl.style.display=vl.style.display=tag.style.display='none';});
+
+stage.addEventListener('click',async e=>{
   const p=dev(e);const xy='['+p.x+', '+p.y+']';
   try{await navigator.clipboard.writeText(xy);}catch(_){}
   const li=document.createElement('li');
@@ -1277,19 +1306,35 @@ sc.addEventListener('click',async e=>{
   list.prepend(li);
   if(document.getElementById('dotap').checked)tapDevice(p.x,p.y);
 });
+
 async function tapDevice(x,y){
   try{await fetch('/api/tap',{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify({x,y})});}catch(_){}
-  setTimeout(refresh,350);
+  setTimeout(()=>refresh(true),350);
 }
 function clearList(){list.innerHTML='';}
+
 let busy=false;
-async function refresh(){
+async function refresh(force){
   if(busy)return;busy=true;
-  try{const r=await fetch('/api/screenshot',{headers:{'x-api-key':K}});if(r.ok){const u=URL.createObjectURL(await r.blob());const old=sc.src;sc.src=u;if(old.startsWith('blob:'))URL.revokeObjectURL(old);}}catch(_){}
-  finally{busy=false;}
+  try{
+    const r=await fetch('/api/screenshot',{headers:{'x-api-key':K},cache:'no-store'});
+    if(r.ok){
+      const u=URL.createObjectURL(await r.blob());const old=sc.src;
+      sc.onload=()=>{haveShot=true;msg.style.display='none';
+        setStatus('Connected — '+(sc.naturalWidth||'?')+' × '+(sc.naturalHeight||'?')+' px. Hover and click the screen.','ok');};
+      sc.src=u;if(old&&old.startsWith('blob:'))URL.revokeObjectURL(old);
+    }else{
+      let why='';try{const j=await r.json();why=j.error||('HTTP '+r.status);}catch(_){why='HTTP '+r.status;}
+      if(!haveShot){msg.textContent='⚠ No screen';msg.style.display='flex';}
+      setStatus('Device not responding — '+why+'. Reconnect adb, then Refresh.','bad');
+    }
+  }catch(e){
+    if(!haveShot){msg.textContent='⚠ Can\\'t reach server';msg.style.display='flex';}
+    setStatus('Fetch failed: '+(e.message||e)+'','bad');
+  }finally{busy=false;}
 }
 setInterval(()=>{if(!document.hidden)refresh();},1500);
-refresh();
+refresh(true);
 </script></body></html>`;
 
 // ---------------------------- start ----------------------------
