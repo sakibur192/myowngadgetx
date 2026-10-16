@@ -105,17 +105,26 @@ function reconnect() {
   return reconnecting;
 }
 
-const CONN_ERR = /not found|offline|no devices|closed|cannot connect|failed to connect|unauthorized/i;
+// Treat these as "the device blipped" — reconnect and retry rather than hard-fail.
+const CONN_ERR = /not found|offline|no devices|closed|cannot connect|failed to connect|unauthorized|command failed|device .*not found|error:/i;
 
+// Self-healing: up to 3 tries, reconnecting between them, so a brief tunnel/Wi-Fi drop
+// doesn't fail a whole step.
 async function adb(args, opts) {
   if (reconnecting) await reconnecting.catch(() => {});
-  try {
-    return await execAdb(['-s', DEVICE, ...args], opts);
-  } catch (e) {
-    if (!CONN_ERR.test(e.message)) throw e;
-    await reconnect();
-    return execAdb(['-s', DEVICE, ...args], opts);
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await execAdb(['-s', DEVICE, ...args], opts);
+    } catch (e) {
+      lastErr = e;
+      if (!CONN_ERR.test(e.message)) throw e;      // a real command error — don't loop
+      log('  adb retry ' + (attempt + 1) + '/3 after: ' + e.message.split('\n')[0]);
+      await reconnect().catch(() => {});
+      await sleep(500);
+    }
   }
+  throw lastErr;
 }
 // Log every device command except the noisy polling ones (screenshot, ui dump, status).
 const NOISY = /screencap|uiautomator|dumpsys window|getprop sys\.boot|settings get secure|pm list packages/;
