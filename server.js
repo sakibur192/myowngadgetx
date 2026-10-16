@@ -1060,7 +1060,7 @@ textarea{resize:vertical;min-height:52px}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let K=localStorage.getItem('rk')||'';$('key').value=K;
+let K=localStorage.getItem('rk')||'${API_KEY}';$('key').value=K;
 function saveKey(){K=$('key').value.trim();localStorage.setItem('rk',K);$('veil').classList.toggle('hide',!!K);refresh();status();loadApps();}
 function log(m,cls){const l=$('log');const s=document.createElement('div');if(cls)s.className=cls;s.textContent=new Date().toLocaleTimeString()+'  '+m;l.prepend(s);while(l.childElementCount>60)l.lastChild.remove();}
 async function call(a,b){
@@ -1153,14 +1153,9 @@ button:disabled{opacity:.5;cursor:default}
   <h1>GadgetX Flow</h1>
   <p class="sub">One step at a time. Each unlocks after the one before it succeeds.</p>
 
-  <div class="card" id="c0">
-    <div class="step">Connect</div>
-    <input id="key" type="password" placeholder="API key" autocomplete="off">
-    <button onclick="connect()">Connect</button>
-    <div class="msg" id="m0"></div>
-  </div>
+  <div class="msg" id="m0" style="margin-bottom:14px"></div>
 
-  <div class="card locked" id="c1">
+  <div class="card" id="c1">
     <div class="step">Step 1 — Mobile</div>
     <input id="mobile" type="text" placeholder="Mobile number" inputmode="numeric">
     <button id="b1" onclick="doStep(1,'/api/reg-mobile',()=>({mobile:v('mobile')}))">Mobile &rarr; Next</button>
@@ -1183,19 +1178,18 @@ button:disabled{opacity:.5;cursor:default}
   </div>
 </div>
 <script>
-var K='';
+var K='${API_KEY}';
 function $(i){return document.getElementById(i)}
 function v(i){return $(i).value.trim()}
 function unlock(n){$('c'+n).classList.remove('locked')}
 function lock(n){$('c'+n).classList.add('locked')}
 async function connect(){
-  K=v('key');if(!K){$('m0').textContent='Enter the key';return}
   try{
     const r=await fetch('/api/status',{headers:{'x-api-key':K}});
     const j=await r.json();
-    if(!j.ok){$('m0').innerHTML='<span class=err>'+ (j.error||'bad key') +'</span>';return}
-    $('m0').innerHTML='<span class=ok>Connected'+(j.screen&&j.screen.name?(' — on '+j.screen.name):'')+'</span>';
-    $('c0').classList.add('done');unlock(1);$('mobile').focus();
+    if(!j.ok){$('m0').innerHTML='<span class=err>'+ (j.error||'not connected') +'</span>';return}
+    $('m0').innerHTML='<span class=ok>Device connected'+(j.screen&&j.screen.name?(' — on '+j.screen.name):'')+'</span>';
+    $('mobile').focus();
   }catch(e){$('m0').innerHTML='<span class=err>'+e.message+'</span>'}
 }
 async function doStep(n,path,body){
@@ -1221,6 +1215,7 @@ async function showScreen(){
     const img=$('shot');img.src=URL.createObjectURL(await r.blob());img.style.display='block';
   }catch(e){}
 }
+connect();
 </script></body></html>`;
 
 // ---------------------------- start ----------------------------
