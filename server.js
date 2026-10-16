@@ -886,19 +886,22 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: same shape as the mobile step — tap the OTP field, then fill it. The OTP SMS
-  // is already on the phone's clipboard, so we paste it (KEYCODE_PASTE) instead of typing,
-  // then tap the final Confirm button.
-  'reg-otp': async () => {
-    log('STEP otp: tap field + paste from clipboard');
+  // Step 3: exactly like the mobile step — tap the OTP field and TYPE the OTP/SMS text
+  // that was sent with the request, then tap Confirm. (We do NOT use the device clipboard:
+  // it still holds the mobile number from step 1, which is what was being pasted before.)
+  'reg-otp': async ({ code, message, text }) => {
+    const otp = String(code ?? message ?? text ?? '').trim();
+    log('STEP otp=' + JSON.stringify(otp));
+    if (!otp) throw new Error('No OTP text sent — paste the OTP/SMS in the box first');
     await tapXY(REGISTER.otpXY, 'OTP field');
     await sleep(400);
-    await shell('input keyevent 279');                    // KEYCODE_PASTE (clipboard = the OTP SMS)
-    await sleep(400);
+    await clearField();                 // wipe anything stale in the field first
+    await inputChars(otp);              // type the OTP, same mechanism as the mobile number
+    await sleep(300);
     if (REGISTER.otpNextXY) {
       await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
     }
-    return { step: 'otp', via: 'clipboard-paste' };
+    return { step: 'otp', otp };
   },
 
   // Test the keypad: type any digit string on it.
@@ -1349,10 +1352,10 @@ button:disabled{opacity:.5;cursor:default}
 
   <div class="card locked" id="c3">
     <div class="step">Step 3 — OTP</div>
-    <p class="hint">Copy the OTP SMS on this phone (open Messages &rarr; long-press the code &rarr; Copy), then come back here. Your place is saved — you'll return to this step.</p>
-    <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({}))">Paste OTP &amp; Confirm</button>
+    <p class="hint">Copy the OTP SMS on this phone, then paste it in the box below and submit. Your place is saved — you'll return to this step after switching apps.</p>
+    <input id="otp" type="text" placeholder="Paste the OTP / SMS here" inputmode="numeric">
+    <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({code:v('otp')}))">Submit OTP</button>
     <div class="msg" id="m3"></div>
-    <img id="shot" alt="current screen">
   </div>
 
   <button onclick="startOver()" style="background:none;border:1px solid var(--line);color:var(--muted);font-weight:500;margin-top:4px">Start over (new registration)</button>
@@ -1384,7 +1387,7 @@ function restore(){
     // jump straight to where we left off (the OTP step after an app-switch)
     const card=$('c'+step);
     if(card){card.scrollIntoView({block:'center'});}
-    if(step===3)$('m3').innerHTML='<span class=ok>Back on the OTP step. Copy the SMS, then tap “Paste OTP &amp; Confirm”.</span>';
+    if(step===3)$('m3').innerHTML='<span class=ok>Back on the OTP step. Paste the OTP/SMS below and submit.</span>';
   }
 }
 
@@ -1409,18 +1412,11 @@ async function doStep(n,path,body){
       if(n===1)s.mobile=v('mobile');
       if(n===2)s.pin=v('pin');
       if(n<3){unlock(n+1);s.step=n+1;saveState(s);}
-      else{s.step=3;saveState(s);await showScreen();}
+      else{s.step=3;saveState(s);m.innerHTML='<span class=ok>&#10003; OTP submitted</span>';}
     }else{
       m.innerHTML='<span class=err>&#10007; '+(j.error||'failed')+'</span>';btn.disabled=false;
     }
   }catch(e){m.innerHTML='<span class=err>'+e.message+'</span>';btn.disabled=false;}
-}
-async function showScreen(){
-  try{
-    const r=await fetch('/api/screenshot',{headers:{'x-api-key':K}});
-    if(!r.ok)return;
-    const img=$('shot');img.src=URL.createObjectURL(await r.blob());img.style.display='block';
-  }catch(e){}
 }
 function startOver(){resetState();location.reload();}
 
