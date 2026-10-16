@@ -1352,6 +1352,7 @@ input{width:100%;background:var(--field);border:1px solid var(--line);border-rad
 button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:12px;font:inherit;font-weight:600;cursor:pointer}
 button:disabled{opacity:.5;cursor:default}
 .msg{font-size:13px;margin-top:8px;min-height:18px;white-space:pre-wrap;word-break:break-word}
+.hint{font-size:13px;color:var(--muted);margin:0 0 10px}
 .ok{color:var(--ok)}.err{color:var(--err)}
 #shot{width:100%;border:1px solid var(--line);border-radius:12px;margin-top:8px;display:none}
 </style></head><body>
@@ -1377,25 +1378,51 @@ button:disabled{opacity:.5;cursor:default}
 
   <div class="card locked" id="c3">
     <div class="step">Step 3 — OTP</div>
-    <input id="otp" type="text" placeholder="Paste the OTP code" inputmode="numeric">
-    <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({code:v('otp')}))">Submit OTP</button>
+    <p class="hint">Copy the OTP SMS on this phone (open Messages &rarr; long-press the code &rarr; Copy), then come back here. Your place is saved — you'll return to this step.</p>
+    <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({}))">Paste OTP &amp; Confirm</button>
     <div class="msg" id="m3"></div>
     <img id="shot" alt="current screen">
   </div>
+
+  <button onclick="startOver()" style="background:none;border:1px solid var(--line);color:var(--muted);font-weight:500;margin-top:4px">Start over (new registration)</button>
 </div>
 <script>
 var K='${API_KEY}';
+var SKEY='gxflow';            // saved wizard progress (survives tab reloads when app-switching)
 function $(i){return document.getElementById(i)}
 function v(i){return $(i).value.trim()}
 function unlock(n){$('c'+n).classList.remove('locked')}
 function lock(n){$('c'+n).classList.add('locked')}
+
+// ---- persistence: remember the step + entered values so switching to the SMS app
+//      and coming back doesn't throw us back to step 1 ----
+function loadState(){try{return JSON.parse(localStorage.getItem(SKEY))||{}}catch(_){return{}}}
+function saveState(s){try{localStorage.setItem(SKEY,JSON.stringify(s))}catch(_){}}
+function resetState(){try{localStorage.removeItem(SKEY)}catch(_){}}
+
+function restore(){
+  const s=loadState();
+  if(s.mobile)$('mobile').value=s.mobile;
+  if(s.pin)$('pin').value=s.pin;
+  const step=s.step||1;
+  if(s.done&&s.done[1]){$('c1').classList.add('done');}
+  if(s.done&&s.done[2]){$('c2').classList.add('done');}
+  if(step>=2)unlock(2);
+  if(step>=3)unlock(3);
+  if(step>1){
+    // jump straight to where we left off (the OTP step after an app-switch)
+    const card=$('c'+step);
+    if(card){card.scrollIntoView({block:'center'});}
+    if(step===3)$('m3').innerHTML='<span class=ok>Back on the OTP step. Copy the SMS, then tap “Paste OTP &amp; Confirm”.</span>';
+  }
+}
+
 async function connect(){
   try{
     const r=await fetch('/api/status',{headers:{'x-api-key':K}});
     const j=await r.json();
     if(!j.ok){$('m0').innerHTML='<span class=err>'+ (j.error||'not connected') +'</span>';return}
     $('m0').innerHTML='<span class=ok>Device connected'+(j.screen&&j.screen.name?(' — on '+j.screen.name):'')+'</span>';
-    $('mobile').focus();
   }catch(e){$('m0').innerHTML='<span class=err>'+e.message+'</span>'}
 }
 async function doStep(n,path,body){
@@ -1407,8 +1434,11 @@ async function doStep(n,path,body){
     if(j.ok){
       m.innerHTML='<span class=ok>&#10003; '+JSON.stringify(j.result)+'</span>';
       $('c'+n).classList.add('done');
-      if(n<3){unlock(n+1);}
-      else{await showScreen();}
+      const s=loadState();s.done=s.done||{};s.done[n]=true;
+      if(n===1)s.mobile=v('mobile');
+      if(n===2)s.pin=v('pin');
+      if(n<3){unlock(n+1);s.step=n+1;saveState(s);}
+      else{s.step=3;saveState(s);await showScreen();}
     }else{
       m.innerHTML='<span class=err>&#10007; '+(j.error||'failed')+'</span>';btn.disabled=false;
     }
@@ -1421,7 +1451,13 @@ async function showScreen(){
     const img=$('shot');img.src=URL.createObjectURL(await r.blob());img.style.display='block';
   }catch(e){}
 }
+function startOver(){resetState();location.reload();}
+
+restore();
 connect();
+// If the tab was restored from the mobile bfcache after an app-switch, re-apply our place.
+window.addEventListener('pageshow',function(e){if(e.persisted)restore();});
+document.addEventListener('visibilitychange',function(){if(!document.hidden){restore();connect();}});
 </script></body></html>`;
 
 // ---------------------------- /tapsfinder ----------------------------
