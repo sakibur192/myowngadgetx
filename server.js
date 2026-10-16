@@ -39,18 +39,32 @@ const OTP_SENDER = '01750006696';
 // A selector can be { id: 'etName' } or { text: 'Full name' } or { contains: true, text: 'name' }.
 // Registration taps fixed screen coordinates (x,y) captured from GET /api/ui on THIS
 // device. If you move to a screen of a different size, recapture and update these.
-//   page 1: name field -> paste name -> Next
-//   page 2: mobile field -> type digits -> Next (this sends the OTP)
-//   page 3: Paste button (reads clipboard) -> Confirm
+// NEW flow:
+//   mobile field -> type digits -> Next
+//   PIN page     -> tap each PIN digit on the on-screen keypad -> Next (requests OTP)
+//   OTP page     -> tap each OTP digit on the keypad -> DONE
+// All coordinates are device pixels (from GET /api/ui). CHANGE the ones marked.
 const REGISTER = {
-  nameXY:    [582, 721],    // name input
-  next1XY:   [540, 1102],   // Next on page 1
-  mobileXY:  [540, 934],    // mobile input
-  next2XY:   [540, 1366],   // Next on page 2 (requests OTP)
-  pasteXY:   [540, 1395],   // the app's Paste button on the OTP page
-  confirmXY: [814, 1592],   // the Confirm button
-  pageWaitMs: 1800,         // pause after each page change
+  mobileXY:     [540, 934],    // mobile number field                     (verify)
+  nextMobileXY: [540, 1366],   // Next button after the mobile number      (verify)
+  nextPinXY:    [540, 1366],   // Next button after the 4-digit PIN         (CHANGE)
+  pageWaitMs:   1800,          // pause after each page change
 };
+
+// On-screen numeric keypad (the blue keypad). Give the CENTER of the "1" key and the
+// "DONE" key; every other key is computed from the 3-column x 4-row grid below.
+const KEYPAD = {
+  layout: [['1','2','3'], ['4','5','6'], ['7','8','9'], ['DEL','0','DONE']],
+  oneXY:  [300, 980],    // CHANGE: center of the "1" key
+  doneXY: [760, 1500],   // CHANGE: center of the "DONE" key (bottom-right)
+  keyDelayMs: 250,       // pause between key taps
+};
+
+// Default 4-digit PIN (used when the app/dashboard doesn't send one).
+const PIN = '1234';
+
+// Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
+const AUTO_TYPE_SMS_OTP_UNUSED = false;
 
 // Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
 const AUTO_TYPE_SMS_OTP = false;
@@ -105,26 +119,17 @@ function reconnect() {
   return reconnecting;
 }
 
-// Treat these as "the device blipped" — reconnect and retry rather than hard-fail.
-const CONN_ERR = /not found|offline|no devices|closed|cannot connect|failed to connect|unauthorized|command failed|device .*not found|error:/i;
+const CONN_ERR = /not found|offline|no devices|closed|cannot connect|failed to connect|unauthorized/i;
 
-// Self-healing: up to 3 tries, reconnecting between them, so a brief tunnel/Wi-Fi drop
-// doesn't fail a whole step.
 async function adb(args, opts) {
   if (reconnecting) await reconnecting.catch(() => {});
-  let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await execAdb(['-s', DEVICE, ...args], opts);
-    } catch (e) {
-      lastErr = e;
-      if (!CONN_ERR.test(e.message)) throw e;      // a real command error — don't loop
-      log('  adb retry ' + (attempt + 1) + '/3 after: ' + e.message.split('\n')[0]);
-      await reconnect().catch(() => {});
-      await sleep(500);
-    }
+  try {
+    return await execAdb(['-s', DEVICE, ...args], opts);
+  } catch (e) {
+    if (!CONN_ERR.test(e.message)) throw e;
+    await reconnect();
+    return execAdb(['-s', DEVICE, ...args], opts);
   }
-  throw lastErr;
 }
 // Log every device command except the noisy polling ones (screenshot, ui dump, status).
 const NOISY = /screencap|uiautomator|dumpsys window|getprop sys\.boot|settings get secure|pm list packages/;
@@ -393,8 +398,44 @@ async function tapXY(xy, labelStr) {
   await shell(`input tap ${xy[0]} ${xy[1]}`);
 }
 
-// When the mobile step runs it "arms" this; the next incoming SMS then auto-completes
-// the OTP page (clipboard -> Paste -> Confirm). 0 = not armed.
+// Keep only digits (for PIN / OTP typed on the numeric keypad).
+function digitsOnly(s) {
+  return String(s ?? '').replace(/\D/g, '');
+}
+
+// Compute a keypad key's center from the two corner keys ("1" and "DONE").
+function keyXY(k) {
+  const L = KEYPAD.layout, rows = L.length, cols = L[0].length;
+  let r = -1, c = -1;
+  for (let i = 0; i < rows; i++) {
+    const j = L[i].indexOf(k);
+    if (j >= 0) { r = i; c = j; break; }
+  }
+  if (r < 0) throw new Error('key not on keypad: ' + k);
+  const [x1, y1] = KEYPAD.oneXY, [x2, y2] = KEYPAD.doneXY;
+  const x = x1 + (cols > 1 ? ((x2 - x1) / (cols - 1)) * c : 0);
+  const y = y1 + (rows > 1 ? ((y2 - y1) / (rows - 1)) * r : 0);
+  return [Math.round(x), Math.round(y)];
+}
+
+// Tap a sequence of digits on the on-screen keypad. If submit, tap DONE after.
+async function tapPad(str, { submit = false } = {}) {
+  const digits = digitsOnly(str);
+  for (const ch of digits) {
+    const xy = keyXY(ch);
+    log('  key ' + ch + ' (' + xy[0] + ',' + xy[1] + ')');
+    await shell(`input tap ${xy[0]} ${xy[1]}`);
+    await sleep(KEYPAD.keyDelayMs);
+  }
+  if (submit) {
+    const d = keyXY('DONE');
+    log('  key DONE (' + d[0] + ',' + d[1] + ')');
+    await shell(`input tap ${d[0]} ${d[1]}`);
+  }
+  return digits;
+}
+
+// Armed by the PIN step; the next incoming SMS then types the OTP on the keypad.
 let awaitingOtpUntil = 0;
 const OTP_ARM_MS = 180000;
 
@@ -619,86 +660,67 @@ const actions = {
     return { keyboard: 'ready' };
   },
 
-  // Coordinate-based registration: taps fixed (x,y) on each page. Logs every step.
-  // No type checking — name and mobile are taken as-is, any string. Never reopens the app.
-  register: async ({ name, mobile, otpTimeout = 120000 }) => {
+  // Full registration (one call): mobile -> Next -> PIN (keypad) -> Next -> wait SMS -> OTP (keypad) -> DONE
+  register: async ({ mobile, pin = PIN, otpTimeout = 120000 }) => {
     const R = REGISTER;
     const done = [];
-    const tap = async (xy, labelStr) => {
-      log('  tap', labelStr, '(' + xy[0] + ',' + xy[1] + ')');
-      await shell(`input tap ${xy[0]} ${xy[1]}`);
-    };
+    log('REGISTER start mobile=' + mobile + ' pin=' + pin);
 
-    log('REGISTER start name=' + JSON.stringify(name) + ' mobile=' + mobile);
-
-    // Page 1 — name
-    await tap(R.nameXY, 'name field');
-    await sleep(400);
-    log('  paste name:', name);
-    await insertText(name || '');
-    done.push('name entered');
-    await tap(R.next1XY, 'Next (1)');
-    await sleep(R.pageWaitMs);
-
-    // Page 2 — mobile (digits injected as key events)
-    await tap(R.mobileXY, 'mobile field');
+    await tapXY(R.mobileXY, 'mobile field');
     await sleep(400);
     log('  type mobile:', mobile);
     await inputChars(String(mobile ?? ''));
     done.push('mobile entered');
-    await tap(R.next2XY, 'Next (2) — requests OTP');
-    done.push('OTP requested');
-
-    // Wait for a freshly-forwarded SMS (any number) and use the WHOLE message (no regex)
-    log('  waiting for forwarded SMS…');
-    const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000), lookbackMs: 2000 });
-    const code = String(sms.message).trim();
-    log('  SMS received -> clipboard:', JSON.stringify(code));
-    await setClipboard(code);
-    done.push('SMS on clipboard');
+    await tapXY(R.nextMobileXY, 'Next (mobile)');
     await sleep(R.pageWaitMs);
 
-    // Page 3 — tap the app's Paste button, then Confirm
-    await tap(R.pasteXY, 'Paste button');
-    await sleep(700);
-    await tap(R.confirmXY, 'Confirm');
-    done.push('confirmed');
+    log('  enter PIN on keypad:', pin);
+    await tapPad(String(pin));
+    done.push('pin entered');
+    await tapXY(R.nextPinXY, 'Next (pin) — requests OTP');
+    done.push('OTP requested');
+
+    log('  waiting for forwarded SMS…');
+    const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000), lookbackMs: 2000 });
+    const otp = digitsOnly(sms.message);
+    log('  OTP digits -> keypad:', otp);
+    await sleep(R.pageWaitMs);
+    await tapPad(otp, { submit: true });
+    done.push('OTP ' + otp + ' entered');
 
     log('REGISTER done:', JSON.stringify(done));
-    return { name, mobile, sms: sms.message, steps: done };
+    return { mobile, pin, otp, steps: done };
   },
 
   // --- step-by-step, driven from the app ---
-  // Step 1: tap name field, paste name, tap Next.
-  'reg-name': async ({ name }) => {
-    log('STEP name=' + JSON.stringify(name));
-    await tapXY(REGISTER.nameXY, 'name field');
-    await sleep(400);
-    await insertText(name || '');
-    await tapXY(REGISTER.next1XY, 'Next (1)');
-    return { step: 'name', name: name || '' };
-  },
-
-  // Step 2: tap mobile field, type number, tap Next (requests OTP), then ARM auto-OTP.
+  // Step 1: tap mobile field, type number, tap Next.
   'reg-mobile': async ({ mobile }) => {
     log('STEP mobile=' + mobile);
     await tapXY(REGISTER.mobileXY, 'mobile field');
     await sleep(400);
     await inputChars(String(mobile ?? ''));
-    await tapXY(REGISTER.next2XY, 'Next (2) — requests OTP');
-    awaitingOtpUntil = Date.now() + OTP_ARM_MS;
-    log('  auto-OTP armed for ' + OTP_ARM_MS / 1000 + 's (next SMS will Paste + Confirm)');
-    return { step: 'mobile', mobile: String(mobile ?? ''), armed: true };
+    await tapXY(REGISTER.nextMobileXY, 'Next (mobile)');
+    return { step: 'mobile', mobile: String(mobile ?? '') };
   },
 
-  // Step 3 (manual fallback): clipboard -> Paste -> Confirm, using the latest SMS text.
-  'reg-otp': async ({ code }) => {
-    if (code != null && code !== '') await setClipboard(String(code));
-    await tapXY(REGISTER.pasteXY, 'Paste');
-    await sleep(700);
-    await tapXY(REGISTER.confirmXY, 'Confirm');
-    return { step: 'otp' };
+  // Step 2: tap the 4-digit PIN on the keypad, tap Next, then ARM auto-OTP.
+  'reg-pin': async ({ pin = PIN }) => {
+    log('STEP pin=' + pin);
+    const typed = await tapPad(String(pin));
+    await tapXY(REGISTER.nextPinXY, 'Next (pin) — requests OTP');
+    awaitingOtpUntil = Date.now() + OTP_ARM_MS;
+    log('  auto-OTP armed for ' + OTP_ARM_MS / 1000 + 's (next SMS -> keypad + DONE)');
+    return { step: 'pin', pin: typed, armed: true };
   },
+
+  // Step 3 (manual fallback): type the OTP digits on the keypad, then DONE.
+  'reg-otp': async ({ code }) => {
+    const otp = await tapPad(code, { submit: true });
+    return { step: 'otp', otp };
+  },
+
+  // Test the keypad: type any digit string on it.
+  'keypad': async ({ digits, submit = false }) => ({ typed: await tapPad(digits, { submit }) }),
 
   'set-clipboard': async ({ text }) => ({ clipboard: await setClipboard(text) }),
 
@@ -805,29 +827,21 @@ app.post('/api/sms', (req, res) => {
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
   log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
-  const whole = String(sms.message).trim();
+  const otp = digitsOnly(sms.message);
 
   if (awaitingOtpUntil && Date.now() < awaitingOtpUntil) {
-    // Armed by the mobile step: set clipboard, then Paste + Confirm on the OTP page.
+    // Armed by the PIN step: type the OTP digits on the keypad, then DONE.
     awaitingOtpUntil = 0;
-    log('  auto-OTP: completing OTP page');
+    log('  auto-OTP: typing ' + otp + ' on the keypad');
     exclusive(async () => {
-      await setClipboard(whole);
-      log('  clipboard <- ' + JSON.stringify(whole));
       await sleep(600);
-      await tapXY(REGISTER.pasteXY, 'Paste');
-      await sleep(700);
-      await tapXY(REGISTER.confirmXY, 'Confirm');
+      await tapPad(otp, { submit: true });
       log('  auto-OTP done');
     }).catch((e) => log('  auto-OTP failed: ' + e.message));
-    return res.json({ ok: true, copied: whole, autoOtp: true });
+    return res.json({ ok: true, otp, autoOtp: true });
   }
 
-  // Otherwise just copy the whole SMS onto the clipboard (always, any number).
-  setClipboard(whole)
-    .then(() => log('  clipboard <- ' + JSON.stringify(whole)))
-    .catch((e) => log('  clipboard set failed: ' + e.message));
-  res.json({ ok: true, copied: whole, autoOtp: false });
+  res.json({ ok: true, otp, autoOtp: false });
 });
 
 app.get('/api/sms', (req, res) => {
@@ -1007,27 +1021,30 @@ textarea{resize:vertical;min-height:52px}
     <div class="card">
       <h2>Register &mdash; step by step</h2>
       <div class="stack">
-        <div class="inline"><input id="rname" type="text" placeholder="Name"><button class="btn go" onclick="regName()">Name &rarr; Next</button></div>
-        <div class="inline"><input id="rmobile" type="text" placeholder="Mobile number"><button class="btn go" onclick="regMobile()">Mobile &rarr; Next</button></div>
-        <p class="hint">"Mobile &rarr; Next" requests the OTP and arms auto-complete &mdash; the next SMS is pasted + confirmed automatically.</p>
+        <div class="inline"><input id="rmobile" type="text" placeholder="Mobile number"><button class="btn go" onclick="regMobile()">1 &middot; Mobile &rarr; Next</button></div>
+        <div class="inline"><input id="rpin" type="text" placeholder="4-digit PIN" maxlength="8"><button class="btn go" onclick="regPin()">2 &middot; PIN &rarr; Next</button></div>
+        <p class="hint">PIN is tapped on the keypad. "PIN &rarr; Next" arms auto-OTP &mdash; the next SMS is typed on the keypad + DONE automatically.</p>
       </div>
     </div>
 
     <div class="card">
-      <h2>Tap test &mdash; click each to check it lands on the right spot</h2>
+      <h2>Tap test &mdash; click each to check it lands</h2>
       <div class="row" id="taps"></div>
     </div>
 
     <div class="card">
-      <h2>Clipboard</h2>
+      <h2>Keypad test</h2>
       <div class="stack">
-        <input id="clip" type="text" placeholder="Text to copy to the device clipboard">
         <div class="inline">
-          <button class="btn go grow" onclick="copyText()">Copy to clipboard</button>
-          <button class="btn" onclick="call('paste-clipboard',{})">Paste (Ctrl+V)</button>
-          <button class="btn" onclick="tapPaste()">Tap app's Paste</button>
+          <input id="kp" type="text" placeholder="Digits, e.g. 1234" maxlength="10">
+          <button class="btn go" onclick="call('keypad',{digits:$('kp').value})">Type on keypad</button>
+          <button class="btn" onclick="call('keypad',{digits:$('kp').value,submit:true})">+ DONE</button>
         </div>
-        <p class="hint">Copy sets the device clipboard. Paste sends Ctrl+V. "Tap app's Paste" taps your OTP-page Paste button.</p>
+        <div class="inline">
+          <button class="btn" onclick="tapKey('oneXY')">Tap "1"</button>
+          <button class="btn" onclick="tapKey('doneXY')">Tap "DONE"</button>
+        </div>
+        <p class="hint">Use "Tap 1" and "Tap DONE" to confirm the two keypad corners are right; every other key is computed from them.</p>
       </div>
     </div>
 
@@ -1094,14 +1111,14 @@ function key(k){call('key',{key:k});}
 function sendText(){const t=$('text').value;if(t==='')return;call('paste',{text:t});}
 function sendOtp(){const v=$('otp').value.trim();if(!v)return;call('otp',/^\\d{4,8}$/.test(v)?{code:v}:{message:v});}
 function app(a){const p=$('pkg').value;localStorage.setItem('rpkg',p);call(a,{package:p});}
-function regName(){call('reg-name',{name:$('rname').value.trim()});}
 function regMobile(){call('reg-mobile',{mobile:$('rmobile').value.trim()});}
-// Tap-test buttons, built from the server's REGISTER coordinates.
+function regPin(){call('reg-pin',{pin:$('rpin').value.trim()});}
+// Tap-test buttons, built from the server's REGISTER coordinates + keypad corners.
 const COORDS=${JSON.stringify(REGISTER)};
-const TAPLABELS={nameXY:'Name field',next1XY:'Next 1',mobileXY:'Mobile field',next2XY:'Next 2',pasteXY:'Paste btn',confirmXY:'Confirm'};
+const KPAD=${JSON.stringify(KEYPAD)};
+const TAPLABELS={mobileXY:'Mobile field',nextMobileXY:'Next (mobile)',nextPinXY:'Next (pin)'};
 (function(){const box=$('taps');for(const k in TAPLABELS){const xy=COORDS[k];if(!xy)continue;const b=document.createElement('button');b.className='btn';b.textContent=TAPLABELS[k]+' ('+xy[0]+','+xy[1]+')';b.onclick=()=>call('tap',{x:xy[0],y:xy[1]});box.appendChild(b);}})();
-function copyText(){call('set-clipboard',{text:$('clip').value});}
-function tapPaste(){const xy=COORDS.pasteXY;if(xy)call('tap',{x:xy[0],y:xy[1]});}
+function tapKey(c){const xy=KPAD[c];if(xy)call('tap',{x:xy[0],y:xy[1]});}
 if(K){$('veil').classList.add('hide');loadApps();}
 setInterval(()=>{if($('auto').checked&&!document.hidden)refresh();},1500);
 setInterval(status,2500);
