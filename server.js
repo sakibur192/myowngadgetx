@@ -773,6 +773,7 @@ function auth(req, res, next) {
 
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
 app.get('/flow', (req, res) => res.type('html').send(FLOW_HTML));
+app.get('/tapsfinder', (req, res) => res.type('html').send(FINDER_HTML));
 app.use('/api', auth);
 
 app.get('/api/status', async (req, res) => {
@@ -1226,6 +1227,69 @@ async function showScreen(){
   }catch(e){}
 }
 connect();
+</script></body></html>`;
+
+// ---------------------------- /tapsfinder ----------------------------
+const FINDER_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Taps Finder</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;display:flex;gap:14px;padding:14px;flex-wrap:wrap}
+.stage{position:relative;line-height:0}
+#screen{max-height:92vh;border:1px solid var(--line);border-radius:10px;cursor:crosshair;background:#000;display:block}
+#hline,#vline{position:absolute;background:rgba(47,111,237,.7);pointer-events:none}
+#hline{left:0;right:0;height:1px}#vline{top:0;bottom:0;width:1px}
+#tag{position:absolute;transform:translate(8px,8px);background:#000a;color:#fff;font:12px monospace;padding:2px 6px;border-radius:5px;pointer-events:none;white-space:nowrap}
+.panel{flex:1;min-width:260px;display:flex;flex-direction:column;gap:10px}
+h1{font-size:16px;margin:0}.sub{color:var(--muted);font-size:12px;margin:0}
+.big{font:600 22px/1.2 monospace;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;text-align:center}
+label{display:flex;gap:8px;align-items:center;font-size:13px}
+button{background:var(--panel);border:1px solid var(--line);color:inherit;border-radius:8px;padding:8px 10px;cursor:pointer;font:inherit}
+button:hover{border-color:var(--accent)}
+#list{list-style:none;margin:0;padding:0;max-height:60vh;overflow:auto}
+#list li{display:flex;justify-content:space-between;gap:8px;font:13px monospace;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 10px;margin-bottom:6px}
+#list .x{cursor:pointer;color:var(--accent)}
+</style></head><body>
+<div class="stage">
+  <img id="screen" alt="screen">
+  <div id="hline"></div><div id="vline"></div><div id="tag"></div>
+</div>
+<div class="panel">
+  <h1>Taps Finder</h1>
+  <p class="sub">Move over the screen to read the device X,Y. Click to capture. Each capture is copied to your clipboard.</p>
+  <div class="big" id="cur">—</div>
+  <label><input type="checkbox" id="dotap"> Also TAP the device on click (to verify the spot)</label>
+  <div style="display:flex;gap:8px"><button onclick="refresh()">Refresh screen</button><button onclick="clearList()">Clear list</button></div>
+  <ul id="list"></ul>
+</div>
+<script>
+const K='${API_KEY}';
+const sc=document.getElementById('screen'),hl=document.getElementById('hline'),vl=document.getElementById('vline'),tag=document.getElementById('tag'),cur=document.getElementById('cur'),list=document.getElementById('list');
+function dev(e){const r=sc.getBoundingClientRect();const w=sc.naturalWidth||720,h=sc.naturalHeight||1280;return{x:Math.round((e.clientX-r.left)*w/r.width),y:Math.round((e.clientY-r.top)*h/r.height),cx:e.clientX-r.left,cy:e.clientY-r.top};}
+sc.addEventListener('mousemove',e=>{const p=dev(e);hl.style.top=p.cy+'px';vl.style.left=p.cx+'px';tag.style.left=p.cx+'px';tag.style.top=p.cy+'px';tag.textContent=p.x+','+p.y;cur.textContent=p.x+' , '+p.y;});
+sc.addEventListener('click',async e=>{
+  const p=dev(e);const xy='['+p.x+', '+p.y+']';
+  try{await navigator.clipboard.writeText(xy);}catch(_){}
+  const li=document.createElement('li');
+  li.innerHTML='<span>'+xy+'</span><span class=x>tap</span>';
+  li.querySelector('.x').onclick=()=>tapDevice(p.x,p.y);
+  list.prepend(li);
+  if(document.getElementById('dotap').checked)tapDevice(p.x,p.y);
+});
+async function tapDevice(x,y){
+  try{await fetch('/api/tap',{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify({x,y})});}catch(_){}
+  setTimeout(refresh,350);
+}
+function clearList(){list.innerHTML='';}
+let busy=false;
+async function refresh(){
+  if(busy)return;busy=true;
+  try{const r=await fetch('/api/screenshot',{headers:{'x-api-key':K}});if(r.ok){const u=URL.createObjectURL(await r.blob());const old=sc.src;sc.src=u;if(old.startsWith('blob:'))URL.revokeObjectURL(old);}}catch(_){}
+  finally{busy=false;}
+}
+setInterval(()=>{if(!document.hidden)refresh();},1500);
+refresh();
 </script></body></html>`;
 
 // ---------------------------- start ----------------------------
