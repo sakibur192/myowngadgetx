@@ -378,6 +378,17 @@ async function setClipboard(text) {
   return t;
 }
 
+// Tap a fixed [x,y] coordinate, with a log line.
+async function tapXY(xy, labelStr) {
+  log('  tap ' + labelStr + ' (' + xy[0] + ',' + xy[1] + ')');
+  await shell(`input tap ${xy[0]} ${xy[1]}`);
+}
+
+// When the mobile step runs it "arms" this; the next incoming SMS then auto-completes
+// the OTP page (clipboard -> Paste -> Confirm). 0 = not armed.
+let awaitingOtpUntil = 0;
+const OTP_ARM_MS = 180000;
+
 async function currentScreen() {
   const out = await shell('dumpsys window | grep -m1 mCurrentFocus').catch(() => '');
   const m = out.match(/\s([\w.]+)\/([\w.$]+)\}/);
@@ -648,6 +659,38 @@ const actions = {
     return { name, mobile, sms: sms.message, steps: done };
   },
 
+  // --- step-by-step, driven from the app ---
+  // Step 1: tap name field, paste name, tap Next.
+  'reg-name': async ({ name }) => {
+    log('STEP name=' + JSON.stringify(name));
+    await tapXY(REGISTER.nameXY, 'name field');
+    await sleep(400);
+    await insertText(name || '');
+    await tapXY(REGISTER.next1XY, 'Next (1)');
+    return { step: 'name', name: name || '' };
+  },
+
+  // Step 2: tap mobile field, type number, tap Next (requests OTP), then ARM auto-OTP.
+  'reg-mobile': async ({ mobile }) => {
+    log('STEP mobile=' + mobile);
+    await tapXY(REGISTER.mobileXY, 'mobile field');
+    await sleep(400);
+    await inputChars(String(mobile ?? ''));
+    await tapXY(REGISTER.next2XY, 'Next (2) — requests OTP');
+    awaitingOtpUntil = Date.now() + OTP_ARM_MS;
+    log('  auto-OTP armed for ' + OTP_ARM_MS / 1000 + 's (next SMS will Paste + Confirm)');
+    return { step: 'mobile', mobile: String(mobile ?? ''), armed: true };
+  },
+
+  // Step 3 (manual fallback): clipboard -> Paste -> Confirm, using the latest SMS text.
+  'reg-otp': async ({ code }) => {
+    if (code != null && code !== '') await setClipboard(String(code));
+    await tapXY(REGISTER.pasteXY, 'Paste');
+    await sleep(700);
+    await tapXY(REGISTER.confirmXY, 'Confirm');
+    return { step: 'otp' };
+  },
+
   'set-clipboard': async ({ text }) => ({ clipboard: await setClipboard(text) }),
 
   'input-chars': async ({ text, field }) => {
@@ -753,13 +796,29 @@ app.post('/api/sms', (req, res) => {
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
   log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
-  // Every SMS, from any number, is copied whole onto the device clipboard immediately,
-  // so the app's Paste button always has the latest message ready.
   const whole = String(sms.message).trim();
+
+  if (awaitingOtpUntil && Date.now() < awaitingOtpUntil) {
+    // Armed by the mobile step: set clipboard, then Paste + Confirm on the OTP page.
+    awaitingOtpUntil = 0;
+    log('  auto-OTP: completing OTP page');
+    exclusive(async () => {
+      await setClipboard(whole);
+      log('  clipboard <- ' + JSON.stringify(whole));
+      await sleep(600);
+      await tapXY(REGISTER.pasteXY, 'Paste');
+      await sleep(700);
+      await tapXY(REGISTER.confirmXY, 'Confirm');
+      log('  auto-OTP done');
+    }).catch((e) => log('  auto-OTP failed: ' + e.message));
+    return res.json({ ok: true, copied: whole, autoOtp: true });
+  }
+
+  // Otherwise just copy the whole SMS onto the clipboard (always, any number).
   setClipboard(whole)
     .then(() => log('  clipboard <- ' + JSON.stringify(whole)))
     .catch((e) => log('  clipboard set failed: ' + e.message));
-  res.json({ ok: true, copied: whole });
+  res.json({ ok: true, copied: whole, autoOtp: false });
 });
 
 app.get('/api/sms', (req, res) => {
@@ -937,12 +996,11 @@ textarea{resize:vertical;min-height:52px}
     </div>
 
     <div class="card">
-      <h2>Register (name &rarr; mobile &rarr; OTP)</h2>
+      <h2>Register &mdash; step by step</h2>
       <div class="stack">
-        <input id="rname" type="text" placeholder="Name">
-        <input id="rmobile" type="text" placeholder="Mobile number">
-        <button class="btn go" onclick="register()">Run registration</button>
-        <p class="hint">Fills the form, waits for an OTP SMS (any number), enters it and confirms.</p>
+        <div class="inline"><input id="rname" type="text" placeholder="Name"><button class="btn go" onclick="regName()">Name &rarr; Next</button></div>
+        <div class="inline"><input id="rmobile" type="text" placeholder="Mobile number"><button class="btn go" onclick="regMobile()">Mobile &rarr; Next</button></div>
+        <p class="hint">"Mobile &rarr; Next" requests the OTP and arms auto-complete &mdash; the next SMS is pasted + confirmed automatically.</p>
       </div>
     </div>
 
@@ -1027,7 +1085,8 @@ function key(k){call('key',{key:k});}
 function sendText(){const t=$('text').value;if(t==='')return;call('paste',{text:t});}
 function sendOtp(){const v=$('otp').value.trim();if(!v)return;call('otp',/^\\d{4,8}$/.test(v)?{code:v}:{message:v});}
 function app(a){const p=$('pkg').value;localStorage.setItem('rpkg',p);call(a,{package:p});}
-function register(){log('registration started — waiting for OTP…');call('register',{name:$('rname').value.trim(),mobile:$('rmobile').value.trim()});}
+function regName(){call('reg-name',{name:$('rname').value.trim()});}
+function regMobile(){call('reg-mobile',{mobile:$('rmobile').value.trim()});}
 // Tap-test buttons, built from the server's REGISTER coordinates.
 const COORDS=${JSON.stringify(REGISTER)};
 const TAPLABELS={nameXY:'Name field',next1XY:'Next 1',mobileXY:'Mobile field',next2XY:'Next 2',pasteXY:'Paste btn',confirmXY:'Confirm'};
