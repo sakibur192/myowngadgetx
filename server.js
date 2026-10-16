@@ -1100,7 +1100,7 @@ async function loadApps(){
   }catch(e){}
 }
 const sc=$('screen');let down=null;
-function pt(e){const r=sc.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*${SCREEN_W}/r.width),y:Math.round((e.clientY-r.top)*${SCREEN_H}/r.height),t:Date.now()};}
+function pt(e){const r=sc.getBoundingClientRect();const w=sc.naturalWidth||${SCREEN_W},h=sc.naturalHeight||${SCREEN_H};return{x:Math.round((e.clientX-r.left)*w/r.width),y:Math.round((e.clientY-r.top)*h/r.height),t:Date.now()};}
 sc.addEventListener('mousedown',e=>{e.preventDefault();down=pt(e);});
 sc.addEventListener('mouseup',e=>{
   if(!down)return;const u=pt(e),d=down;down=null;
