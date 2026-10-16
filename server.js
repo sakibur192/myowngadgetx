@@ -45,10 +45,13 @@ const OTP_SENDER = '01750006696';
 //   OTP page     -> tap each OTP digit on the keypad -> DONE
 // All coordinates are device pixels (from GET /api/ui). CHANGE the ones marked.
 const REGISTER = {
-  mobileXY:     [540, 934],    // mobile number field                     (verify)
-  nextMobileXY: [540, 1366],   // Next button after the mobile number      (verify)
-  nextPinXY:    [540, 1366],   // Next button after the 4-digit PIN         (CHANGE)
-  otpNextXY:    null,          // optional Next/Confirm after the OTP, e.g. [540,1366]  (set if needed)
+  // Pages shifted up when the name step was removed:
+  mobileXY:     [582, 721],    // mobile field   = old NAME field position
+  nextMobileXY: [540, 1102],   // Next (mobile)  = old NAME Next position
+  pinXY:        [540, 934],    // PIN field      = old MOBILE field position
+  nextPinXY:    [540, 1366],   // Next (pin)     = old MOBILE Next position
+  otpXY:        [540, 934],    // OTP field on the OTP page               (CHANGE to real)
+  otpNextXY:    [814, 1592],   // Confirm/Next on the OTP page            (verify)
   pageWaitMs:   1800,          // pause after each page change
 };
 
@@ -672,18 +675,23 @@ const actions = {
     await tapXY(R.nextMobileXY, 'Next (mobile)');
     await sleep(R.pageWaitMs);
 
-    log('  enter PIN on keypad:', pin);
-    await tapPad(String(pin));
+    await tapXY(R.pinXY, 'PIN field');
+    await sleep(400);
+    log('  type PIN:', pin);
+    await inputChars(String(pin ?? ''));
     done.push('pin entered');
-    await tapXY(R.nextPinXY, 'Next (pin) — requests OTP');
+    await tapXY(R.nextPinXY, 'Next (pin)');
     done.push('OTP requested');
 
     log('  waiting for forwarded SMS…');
     const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000), lookbackMs: 2000 });
     const otp = digitsOnly(sms.message);
-    log('  OTP digits -> keypad:', otp);
+    log('  type OTP:', otp);
     await sleep(R.pageWaitMs);
-    await tapPad(otp, { submit: true });
+    await tapXY(R.otpXY, 'OTP field');
+    await sleep(400);
+    await inputChars(otp);
+    if (R.otpNextXY) { await sleep(400); await tapXY(R.otpNextXY, 'Confirm (otp)'); }
     done.push('OTP ' + otp + ' entered');
 
     log('REGISTER done:', JSON.stringify(done));
@@ -701,23 +709,25 @@ const actions = {
     return { step: 'mobile', mobile: String(mobile ?? '') };
   },
 
-  // Step 2: tap the 4-digit PIN on the keypad, tap Next, then ARM auto-OTP.
+  // Step 2: tap the PIN field, type the PIN, tap Next.
   'reg-pin': async ({ pin = PIN }) => {
     log('STEP pin=' + pin);
-    const typed = await tapPad(String(pin));
-    await tapXY(REGISTER.nextPinXY, 'Next (pin) — requests OTP');
-    awaitingOtpUntil = Date.now() + OTP_ARM_MS;
-    log('  auto-OTP armed for ' + OTP_ARM_MS / 1000 + 's (next SMS -> keypad + DONE)');
-    return { step: 'pin', pin: typed, armed: true };
+    await tapXY(REGISTER.pinXY, 'PIN field');
+    await sleep(400);
+    await inputChars(String(pin ?? ''));
+    await tapXY(REGISTER.nextPinXY, 'Next (pin)');
+    return { step: 'pin', pin: String(pin ?? '') };
   },
 
-  // Step 3: type the OTP digits on the keypad, tap DONE, then optional Next/Confirm.
+  // Step 3: tap the OTP field, type the OTP, tap Confirm/Next.
   'reg-otp': async ({ code }) => {
     log('STEP otp=' + code);
-    const otp = await tapPad(code, { submit: true });   // digits + DONE
+    await tapXY(REGISTER.otpXY, 'OTP field');
+    await sleep(400);
+    const otp = await inputChars(String(code ?? ''));
     if (REGISTER.otpNextXY) {
-      await sleep(500);
-      await tapXY(REGISTER.otpNextXY, 'Next (otp)');
+      await sleep(400);
+      await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
     }
     return { step: 'otp', otp };
   },
@@ -1120,7 +1130,7 @@ function regPin(){call('reg-pin',{pin:$('rpin').value.trim()});}
 // Tap-test buttons, built from the server's REGISTER coordinates + keypad corners.
 const COORDS=${JSON.stringify(REGISTER)};
 const KPAD=${JSON.stringify(KEYPAD)};
-const TAPLABELS={mobileXY:'Mobile field',nextMobileXY:'Next (mobile)',nextPinXY:'Next (pin)'};
+const TAPLABELS={mobileXY:'Mobile field',nextMobileXY:'Next (mobile)',pinXY:'PIN field',nextPinXY:'Next (pin)',otpXY:'OTP field',otpNextXY:'Confirm (otp)'};
 (function(){const box=$('taps');for(const k in TAPLABELS){const xy=COORDS[k];if(!xy)continue;const b=document.createElement('button');b.className='btn';b.textContent=TAPLABELS[k]+' ('+xy[0]+','+xy[1]+')';b.onclick=()=>call('tap',{x:xy[0],y:xy[1]});box.appendChild(b);}})();
 function tapKey(c){const xy=KPAD[c];if(xy)call('tap',{x:xy[0],y:xy[1]});}
 if(K){$('veil').classList.add('hide');loadApps();}
