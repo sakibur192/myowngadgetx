@@ -49,18 +49,31 @@ const REGISTER = {
   mobileXY:     [582, 721],    // mobile field   = old NAME field position
   nextMobileXY: [540, 1102],   // Next (mobile)  = old NAME Next position
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
-  nextPinXY:    [540, 1366],   // Next (pin)     = old MOBILE Next position
+  nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
   otpXY:        [540, 934],    // OTP field on the OTP page               (CHANGE to real)
   otpNextXY:    [814, 1592],   // Confirm/Next on the OTP page            (verify)
   pageWaitMs:   1800,          // pause after each page change
 };
 
-// On-screen numeric keypad (the blue keypad). Give the CENTER of the "1" key and the
-// "DONE" key; every other key is computed from the 3-column x 4-row grid below.
+// On-screen numeric keypad. Exact measured center of each digit key (from /tapsfinder,
+// tapped on the real phone). Used for both the PIN and the OTP entry.
 const KEYPAD = {
+  keys: {
+    '0': [553, 2286],
+    '1': [207, 1732],
+    '2': [505, 1781],
+    '3': [906, 1746],
+    '4': [193, 1933],
+    '5': [534, 1949],
+    '6': [890, 1939],
+    '7': [184, 2116],
+    '8': [542, 2099],
+    '9': [918, 2094],
+  },
+  // Fallback 3x4 grid, used only for a key not present in `keys` (e.g. DONE/DEL).
   layout: [['1','2','3'], ['4','5','6'], ['7','8','9'], ['DEL','0','DONE']],
-  oneXY:  [300, 980],    // CHANGE: center of the "1" key
-  doneXY: [760, 1500],   // CHANGE: center of the "DONE" key (bottom-right)
+  oneXY:  [207, 1732],
+  doneXY: [553, 2286],
   keyDelayMs: 250,       // pause between key taps
 };
 
@@ -557,8 +570,9 @@ function digitsOnly(s) {
   return String(s ?? '').replace(/\D/g, '');
 }
 
-// Compute a keypad key's center from the two corner keys ("1" and "DONE").
+// A keypad key's center: use the exact measured map when present, else the computed grid.
 function keyXY(k) {
+  if (KEYPAD.keys && KEYPAD.keys[k]) return KEYPAD.keys[k];
   const L = KEYPAD.layout, rows = L.length, cols = L[0].length;
   let r = -1, c = -1;
   for (let i = 0; i < rows; i++) {
