@@ -897,7 +897,7 @@ const actions = {
     await sleep(400);
     await clearField();                 // wipe anything stale in the field first
     await inputChars(otp);              // type the OTP, same mechanism as the mobile number
-    await sleep(300);
+    await sleep(1000);                  // wait 1s after filling, then the final tap
     if (REGISTER.otpNextXY) {
       await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
     }
