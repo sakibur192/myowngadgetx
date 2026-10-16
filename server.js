@@ -50,8 +50,8 @@ const REGISTER = {
   nextMobileXY: [540, 1102],   // Next (mobile)  = old NAME Next position
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
   nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
-  otpXY:        [540, 934],    // OTP field on the OTP page               (CHANGE to real)
-  otpNextXY:    [814, 1592],   // Confirm/Next on the OTP page            (verify)
+  otpXY:        [247, 1145],   // OTP field — long-press here, then paste the SMS from clipboard
+  otpNextXY:    [814, 1592],   // Confirm on the OTP page   (CHANGE: grab the real one on /tapsfinder)
   pageWaitMs:   1800,          // pause after each page change
 };
 
@@ -886,17 +886,19 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: tap the OTP field (shows keypad), tap each OTP digit on the keypad, tap Confirm.
-  'reg-otp': async ({ code }) => {
-    log('STEP otp=' + code);
-    await tapXY(REGISTER.otpXY, 'OTP field');
+  // Step 3: the incoming OTP SMS is already on the phone's clipboard. Long-press the OTP
+  // field, paste it, then tap the final Confirm button. Nothing is typed.
+  'reg-otp': async () => {
+    const [x, y] = REGISTER.otpXY;
+    log('STEP otp: long-press (' + x + ',' + y + ') + paste from clipboard');
+    await shell(`input swipe ${x} ${y} ${x} ${y} 800`);   // long-press -> focus + Paste menu
+    await sleep(700);
+    await shell('input keyevent 279');                    // KEYCODE_PASTE
     await sleep(500);
-    const otp = await tapPad(String(code));       // taps the digits on the on-screen keypad
     if (REGISTER.otpNextXY) {
-      await sleep(400);
       await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
     }
-    return { step: 'otp', otp };
+    return { step: 'otp', via: 'clipboard-paste' };
   },
 
   // Test the keypad: type any digit string on it.
