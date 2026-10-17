@@ -56,7 +56,7 @@ const REGISTER = {
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
   nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
   otpXY:        [247, 1145],   // OTP: the FIRST box — tapped to focus before entering digits
-  otpNextXY:    [782, 1713],   // Final Submit on the OTP page (not tapped unless otpSubmit=true)
+  otpNextXY:    [810, 1736],   // Confirm/Submit on the OTP page (measured on the real phone)
   pageWaitMs:   1800,          // pause after each page change
 
   // How to put the OTP into the boxed field:
@@ -66,7 +66,7 @@ const REGISTER = {
   //   'paste-popup'  -> Clip Setter sets clipboard, long-press box 1, tap the Paste chip (otpPasteXY)
   //   'type'         -> inputChars via ADB keyboard (usually fails on split boxes)
   otpMode:      'button-paste',
-  otpPasteXY:   [247, 1145],   // the app's Paste BUTTON (measured on the real phone)
+  otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (measured on the real phone)
   otpSubmit:    true,          // true = also tap otpNextXY after entering the OTP
 };
 
@@ -567,12 +567,20 @@ async function inputChars(text) {
 }
 
 // Put text on Android's clipboard. `cmd clipboard` is blocked on this ROM, so we launch
-// the Clip Setter helper app (a foreground app IS allowed to set the clipboard). Text is
-// passed base64 so the whole SMS (spaces/newlines) survives the shell.
+// the Clip Setter helper app (a foreground app IS allowed to set the clipboard).
+// Space-free text (an OTP code) goes as plain --es text (proven to work on this phone);
+// anything with spaces/quotes/metachars goes base64 so the shell can't mangle it.
 async function setClipboard(text) {
   const t = String(text ?? '');
-  const b64 = Buffer.from(t, 'utf8').toString('base64');
-  const out = await shell(`am start -n ${CLIP_ACTIVITY} --es b64 ${b64} --activity-no-animation`);
+  const safe = t.length > 0 && !/[\s"'`$\\<>|;&(){}\[\]*?!#~=]/.test(t);
+  let cmd;
+  if (safe) {
+    cmd = `am start -n ${CLIP_ACTIVITY} --es text ${t} --activity-no-animation`;
+  } else {
+    const b64 = Buffer.from(t, 'utf8').toString('base64');
+    cmd = `am start -n ${CLIP_ACTIVITY} --es b64 ${b64} --activity-no-animation`;
+  }
+  const out = await shell(cmd);
   if (/does not exist|unable to resolve|Error type/i.test(out || '')) {
     throw new Error('Clip Setter app not installed on the phone (install android-build/clip-setter). ' + (out || '').trim());
   }
