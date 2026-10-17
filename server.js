@@ -68,7 +68,7 @@ const REGISTER = {
   //   'type'         -> inputChars via ADB keyboard
   // 'a11y' needs the Clip Setter app's accessibility service enabled once:
   //   Settings -> Accessibility -> GadgetX OTP Filler -> On.
-  otpMode:      'a11y',
+  otpMode:      'a11y-paste',  // accessibility REAL paste (replicates your working manual paste)
   otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (used only in 'button-paste' mode)
   otpSubmit:    false,         // true = also tap otpNextXY after entering the OTP
 };
@@ -937,13 +937,18 @@ const actions = {
     log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
 
     if (mode === 'a11y' || mode === 'a11y-paste') {
-      // Accessibility service fills the OTP field as genuine input (it must be enabled once:
-      // Settings -> Accessibility -> GadgetX OTP Filler). This is treated exactly like a real user.
-      const amMode = mode === 'a11y-paste' ? 'paste' : 'settext';
-      const out = await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es text ${digits} --es mode ${amMode} -p ${CLIP_APP}`);
-      // am broadcast reports delivery; 0 receivers means the service isn't enabled.
-      if (/result=0|Broadcast completed.*result=0/.test(out || '') && !/extras/.test(out || '')) {
-        log('  (a11y) broadcast sent; if nothing filled, enable the OTP Filler accessibility service');
+      // Accessibility service fills the OTP field as GENUINE input (enable once:
+      // Settings -> Accessibility -> GadgetX OTP Filler). Pastes EXACTLY what we send,
+      // as-is, like a manual paste — the app does whatever it does with it.
+      if (mode === 'a11y-paste') {
+        // 1) put the exact text on the clipboard (via Clip Setter)  2) service does a REAL paste
+        await setClipboard(otp);
+        await sleep(700);
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es mode paste -p ${CLIP_APP}`);
+      } else {
+        // service sets the exact text into the focused field (base64 so spaces/newlines survive)
+        const b64 = Buffer.from(otp, 'utf8').toString('base64');
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es b64 ${b64} --es mode settext -p ${CLIP_APP}`);
       }
       if (REGISTER.otpSubmit && REGISTER.otpNextXY) { await sleep(1200); await tapXY(REGISTER.otpNextXY, 'Submit (otp)'); }
       return { step: 'otp', otp, mode };
