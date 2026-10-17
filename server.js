@@ -31,6 +31,11 @@ const OTP_REGEX = /\b(\d{4,8})\b/;     // how the OTP is pulled out of an SMS
 const USE_ADB_KEYBOARD = true;
 const ADB_KEYBOARD_URL = 'https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk';
 
+// Clipboard helper app (android-build/clip-setter). This ROM blocks `cmd clipboard`, so
+// the server launches this tiny app to put the OTP on the phone's clipboard, then pastes.
+const CLIP_APP = 'com.baybex.clipsetter';
+const CLIP_ACTIVITY = CLIP_APP + '/.ClipActivity';
+
 // The number your app's OTP SMS comes from (used to pick the right SMS)
 const OTP_SENDER = '01750006696';
 
@@ -551,30 +556,17 @@ async function inputChars(text) {
   return t;
 }
 
-// Put text on Android's clipboard, so an in-app "Paste" button can read it.
-// `cmd clipboard` isn't on every ROM, so we try a few forms and verify it stuck.
-const CLIP_FAIL = /No shell command implementation|Unknown command|Exception|not found|Error:/i;
+// Put text on Android's clipboard. `cmd clipboard` is blocked on this ROM, so we launch
+// the Clip Setter helper app (a foreground app IS allowed to set the clipboard). Text is
+// passed base64 so the whole SMS (spaces/newlines) survives the shell.
 async function setClipboard(text) {
   const t = String(text ?? '');
-  const sq = `'${t.replace(/'/g, "'\\''")}'`;   // single-quoted for the shell
-  const attempts = [
-    `cmd clipboard set-primary-text ${sq}`,
-    `cmd clipboard set-primary-text ${JSON.stringify(t)}`,
-  ];
-  let lastErr = '';
-  for (const cmd of attempts) {
-    try {
-      const out = await shell(cmd);
-      if (!CLIP_FAIL.test(out || '')) {
-        // verify
-        const got = await shell('cmd clipboard get-primary').catch(() => '');
-        log('[clipboard] set -> get-primary: ' + JSON.stringify((got || '').trim()).slice(0, 80));
-        return t;
-      }
-      lastErr = (out || '').trim();
-    } catch (e) { lastErr = e.message; }
+  const b64 = Buffer.from(t, 'utf8').toString('base64');
+  const out = await shell(`am start -n ${CLIP_ACTIVITY} --es b64 ${b64} --activity-no-animation`);
+  if (/does not exist|unable to resolve|Error type/i.test(out || '')) {
+    throw new Error('Clip Setter app not installed on the phone (install android-build/clip-setter). ' + (out || '').trim());
   }
-  throw new Error('This phone does not allow setting the clipboard from adb (' + (lastErr || 'unsupported') + ')');
+  return t;
 }
 
 // Select all text in the focused field. Ctrl+A on modern Android; falls back to Shift+Home.
@@ -912,18 +904,19 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: long-press the OTP field and type the OTP in. No final tap — the OTP is just
-  // entered into the field and we stop there.
+  // Step 3: typing doesn't register in this OTP field — it needs a real paste (like you do
+  // by hand). The ROM blocks `cmd clipboard`, so we put the OTP on the clipboard via the
+  // Clip Setter helper app, then tap the field and paste. No final submit tap.
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
-    const [x, y] = REGISTER.otpXY;
-    log('STEP otp=' + JSON.stringify(otp) + ' -> type (no submit tap)');
+    log('STEP otp=' + JSON.stringify(otp) + ' -> set clipboard (helper app), tap field, paste');
 
-    await shell(`input swipe ${x} ${y} ${x} ${y} 600`);   // long-press to focus the field
-    await sleep(500);
-    await clearField();
-    await inputChars(otp);                                 // type the OTP into the field
+    await setClipboard(otp);                 // OTP onto the phone clipboard via the helper app
+    await sleep(900);                        // let it set + return focus to the target app
+    await tapXY(REGISTER.otpXY, 'OTP field'); // focus the field
+    await sleep(400);
+    await shell('input keyevent 279');        // KEYCODE_PASTE — same as your manual paste
     return { step: 'otp', otp };
   },
 
