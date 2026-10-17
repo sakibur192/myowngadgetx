@@ -67,7 +67,7 @@ const REGISTER = {
   //   'type'         -> inputChars via ADB keyboard (usually fails on split boxes)
   otpMode:      'button-paste',
   otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (measured on the real phone)
-  otpSubmit:    true,          // true = also tap otpNextXY after entering the OTP
+  otpSubmit:    false,         // true = also tap otpNextXY after entering the OTP
 };
 
 // On-screen numeric keypad. Exact measured center of each digit key (from /tapsfinder,
