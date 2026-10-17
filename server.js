@@ -912,20 +912,18 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: long-press the OTP field, type the OTP in, wait 1s, tap the final Submit.
-  // (No select/cut/paste — just type it and submit.)
+  // Step 3: long-press the OTP field and type the OTP in. No final tap — the OTP is just
+  // entered into the field and we stop there.
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
     const [x, y] = REGISTER.otpXY;
-    log('STEP otp=' + JSON.stringify(otp) + ' -> type, wait, submit');
+    log('STEP otp=' + JSON.stringify(otp) + ' -> type (no submit tap)');
 
     await shell(`input swipe ${x} ${y} ${x} ${y} 600`);   // long-press to focus the field
     await sleep(500);
     await clearField();
     await inputChars(otp);                                 // type the OTP into the field
-    await sleep(1000);                                     // wait 1s
-    if (REGISTER.otpNextXY) await tapXY(REGISTER.otpNextXY, 'Submit (otp)');
     return { step: 'otp', otp };
   },
 
