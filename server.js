@@ -912,40 +912,21 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: get the OTP onto the clipboard WITHOUT cmd clipboard (which this ROM blocks),
-  // by typing it into the field, selecting all, and cutting — selection cut is done by the
-  // foreground app, which Android always allows. Then tap the field and paste it back (a
-  // real paste event), wait 1s, and tap Submit.
+  // Step 3: long-press the OTP field, type the OTP in, wait 1s, tap the final Submit.
+  // (No select/cut/paste — just type it and submit.)
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
     const [x, y] = REGISTER.otpXY;
-    log('STEP otp=' + JSON.stringify(otp) + ' -> type, select-all, cut, paste, submit');
+    log('STEP otp=' + JSON.stringify(otp) + ' -> type, wait, submit');
 
-    // 1) long-press to focus the field (as before), then clear anything stale
-    await shell(`input swipe ${x} ${y} ${x} ${y} 600`);
+    await shell(`input swipe ${x} ${y} ${x} ${y} 600`);   // long-press to focus the field
     await sleep(500);
     await clearField();
-
-    // 2) type the OTP into the field
-    await inputChars(otp);
-    await sleep(400);
-
-    // 3) select all + cut -> the OTP is now on the clipboard, field is emptied
-    const how = await selectAll();
-    await sleep(250);
-    await shell('input keyevent 277');          // KEYCODE_CUT
-    await sleep(400);
-
-    // 4) tap the field (the paste spot) and paste the clipboard back in
-    await tapXY(REGISTER.otpXY, 'Paste');
-    await sleep(300);
-    await shell('input keyevent 279');          // KEYCODE_PASTE
-    await sleep(1000);                          // wait 1s after paste
-
-    // 5) final submit
+    await inputChars(otp);                                 // type the OTP into the field
+    await sleep(1000);                                     // wait 1s
     if (REGISTER.otpNextXY) await tapXY(REGISTER.otpNextXY, 'Submit (otp)');
-    return { step: 'otp', otp, selectAll: how };
+    return { step: 'otp', otp };
   },
 
   // Test the keypad: type any digit string on it.
