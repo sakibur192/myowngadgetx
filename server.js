@@ -50,8 +50,8 @@ const REGISTER = {
   nextMobileXY: [540, 1102],   // Next (mobile)  = old NAME Next position
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
   nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
-  otpXY:        [247, 1145],   // OTP field — tap here, then type the OTP/SMS text
-  otpNextXY:    [794, 1741],   // Confirm on the OTP page   (measured on the real phone)
+  otpXY:        [247, 1145],   // OTP paste spot — tap here, then paste the copied SMS
+  otpNextXY:    [784, 1575],   // Final Submit on the OTP page   (measured on the real phone)
   pageWaitMs:   1800,          // pause after each page change
 };
 
@@ -552,11 +552,37 @@ async function inputChars(text) {
 }
 
 // Put text on Android's clipboard, so an in-app "Paste" button can read it.
+// `cmd clipboard` isn't on every ROM, so we try a few forms and verify it stuck.
+const CLIP_FAIL = /No shell command implementation|Unknown command|Exception|not found|Error:/i;
 async function setClipboard(text) {
-  const t = String(text);
-  const arg = /^[0-9]+$/.test(t) ? t : JSON.stringify(t);
-  await shell(`cmd clipboard set-primary-text ${arg}`);
-  return t;
+  const t = String(text ?? '');
+  const sq = `'${t.replace(/'/g, "'\\''")}'`;   // single-quoted for the shell
+  const attempts = [
+    `cmd clipboard set-primary-text ${sq}`,
+    `cmd clipboard set-primary-text ${JSON.stringify(t)}`,
+  ];
+  let lastErr = '';
+  for (const cmd of attempts) {
+    try {
+      const out = await shell(cmd);
+      if (!CLIP_FAIL.test(out || '')) {
+        // verify
+        const got = await shell('cmd clipboard get-primary').catch(() => '');
+        log('[clipboard] set -> get-primary: ' + JSON.stringify((got || '').trim()).slice(0, 80));
+        return t;
+      }
+      lastErr = (out || '').trim();
+    } catch (e) { lastErr = e.message; }
+  }
+  throw new Error('This phone does not allow setting the clipboard from adb (' + (lastErr || 'unsupported') + ')');
+}
+
+// Select all text in the focused field. Ctrl+A on modern Android; falls back to Shift+Home.
+async function selectAll() {
+  try { await shell('input keycombination 113 29'); return 'ctrl-a'; } catch (_) {}
+  await shell('input keyevent 123').catch(() => {});        // MOVE_END
+  await shell('input keycombination 59 122').catch(() => {});// SHIFT + MOVE_HOME
+  return 'shift-home';
 }
 
 // Tap a fixed [x,y] coordinate, with a log line.
@@ -886,22 +912,40 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: exactly like the mobile step — tap the OTP field and TYPE the OTP/SMS text
-  // that was sent with the request, then tap Confirm. (We do NOT use the device clipboard:
-  // it still holds the mobile number from step 1, which is what was being pasted before.)
+  // Step 3: get the OTP onto the clipboard WITHOUT cmd clipboard (which this ROM blocks),
+  // by typing it into the field, selecting all, and cutting — selection cut is done by the
+  // foreground app, which Android always allows. Then tap the field and paste it back (a
+  // real paste event), wait 1s, and tap Submit.
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
-    log('STEP otp=' + JSON.stringify(otp));
-    if (!otp) throw new Error('No OTP text sent — paste the OTP/SMS in the box first');
-    await tapXY(REGISTER.otpXY, 'OTP field');
+    if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
+    const [x, y] = REGISTER.otpXY;
+    log('STEP otp=' + JSON.stringify(otp) + ' -> type, select-all, cut, paste, submit');
+
+    // 1) long-press to focus the field (as before), then clear anything stale
+    await shell(`input swipe ${x} ${y} ${x} ${y} 600`);
+    await sleep(500);
+    await clearField();
+
+    // 2) type the OTP into the field
+    await inputChars(otp);
     await sleep(400);
-    await clearField();                 // wipe anything stale in the field first
-    await inputChars(otp);              // type the OTP, same mechanism as the mobile number
-    await sleep(1000);                  // wait 1s after filling, then the final tap
-    if (REGISTER.otpNextXY) {
-      await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');
-    }
-    return { step: 'otp', otp };
+
+    // 3) select all + cut -> the OTP is now on the clipboard, field is emptied
+    const how = await selectAll();
+    await sleep(250);
+    await shell('input keyevent 277');          // KEYCODE_CUT
+    await sleep(400);
+
+    // 4) tap the field (the paste spot) and paste the clipboard back in
+    await tapXY(REGISTER.otpXY, 'Paste');
+    await sleep(300);
+    await shell('input keyevent 279');          // KEYCODE_PASTE
+    await sleep(1000);                          // wait 1s after paste
+
+    // 5) final submit
+    if (REGISTER.otpNextXY) await tapXY(REGISTER.otpNextXY, 'Submit (otp)');
+    return { step: 'otp', otp, selectAll: how };
   },
 
   // Test the keypad: type any digit string on it.
@@ -1352,8 +1396,8 @@ button:disabled{opacity:.5;cursor:default}
 
   <div class="card locked" id="c3">
     <div class="step">Step 3 — OTP</div>
-    <p class="hint">Copy the OTP SMS on this phone, then paste it in the box below and submit. Your place is saved — you'll return to this step after switching apps.</p>
-    <input id="otp" type="text" placeholder="Paste the OTP / SMS here" inputmode="numeric">
+    <p class="hint">Paste the OTP (or the whole SMS) in the box and submit. The server puts it on the phone's clipboard, taps Paste, and submits. Your place is saved if you switch apps.</p>
+    <input id="otp" type="text" placeholder="Paste the OTP / SMS here" inputmode="text">
     <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({code:v('otp')}))">Submit OTP</button>
     <div class="msg" id="m3"></div>
   </div>
