@@ -55,9 +55,19 @@ const REGISTER = {
   nextMobileXY: [540, 1102],   // Next (mobile)  = old NAME Next position
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
   nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
-  otpXY:        [247, 1145],   // OTP paste spot — tap here, then paste the copied SMS
-  otpNextXY:    [782, 1713],   // Final Submit on the OTP page   (measured on the real phone)
+  otpXY:        [247, 1145],   // OTP: the FIRST box — tapped to focus before entering digits
+  otpNextXY:    [782, 1713],   // Final Submit on the OTP page (not tapped unless otpSubmit=true)
   pageWaitMs:   1800,          // pause after each page change
+
+  // How to put the OTP into the boxed field:
+  //   'button-paste' -> Clip Setter sets clipboard = SMS, then tap the app's Paste BUTTON (otpPasteXY)
+  //   'keys'         -> send each digit as a hardware key event (for split OTP boxes)
+  //   'paste'        -> Clip Setter sets clipboard, then KEYCODE_PASTE into box 1
+  //   'paste-popup'  -> Clip Setter sets clipboard, long-press box 1, tap the Paste chip (otpPasteXY)
+  //   'type'         -> inputChars via ADB keyboard (usually fails on split boxes)
+  otpMode:      'button-paste',
+  otpPasteXY:   [247, 1145],   // the app's Paste BUTTON (measured on the real phone)
+  otpSubmit:    true,          // true = also tap otpNextXY after entering the OTP
 };
 
 // On-screen numeric keypad. Exact measured center of each digit key (from /tapsfinder,
@@ -904,20 +914,62 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: typing doesn't register in this OTP field — it needs a real paste (like you do
-  // by hand). The ROM blocks `cmd clipboard`, so we put the OTP on the clipboard via the
-  // Clip Setter helper app, then tap the field and paste. No final submit tap.
+  // Step 3: enter the OTP into the boxed field. The method is set by REGISTER.otpMode
+  // (see the config). Default 'keys' sends hardware digit key events, which fill split
+  // OTP boxes even when IME typing and plain paste don't.
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
-    log('STEP otp=' + JSON.stringify(otp) + ' -> set clipboard (helper app), tap field, paste');
+    const digits = digitsOnly(otp);
+    const mode = REGISTER.otpMode || 'keys';
+    const [x, y] = REGISTER.otpXY;
+    log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
 
-    await setClipboard(otp);                 // OTP onto the phone clipboard via the helper app
-    await sleep(900);                        // let it set + return focus to the target app
-    await tapXY(REGISTER.otpXY, 'OTP field'); // focus the field
+    if (mode === 'button-paste') {
+      // Put the SMS/OTP on the clipboard via the Clip Setter app, then tap the app's own
+      // Paste button (it reads the clipboard and fills the boxes). Simplest, most reliable.
+      await setClipboard(otp);
+      await sleep(900);                                   // let it set + return to the app
+      if (!REGISTER.otpPasteXY) throw new Error('Set REGISTER.otpPasteXY to the app\'s Paste button coordinate (grab it on /tapsfinder)');
+      await tapXY(REGISTER.otpPasteXY, 'Paste button');
+      if (REGISTER.otpSubmit && REGISTER.otpNextXY) { await sleep(1000); await tapXY(REGISTER.otpNextXY, 'Submit (otp)'); }
+      return { step: 'otp', otp, mode };
+    }
+
+    // focus the first box
+    await tapXY(REGISTER.otpXY, 'OTP box 1');
     await sleep(400);
-    await shell('input keyevent 279');        // KEYCODE_PASTE — same as your manual paste
-    return { step: 'otp', otp };
+
+    if (mode === 'keys') {
+      // Each digit as a hardware key event: KEYCODE_0..9 = 7..16. Split boxes auto-advance.
+      if (!digits) throw new Error('OTP has no digits to key in');
+      for (const d of digits) {
+        await shell('input keyevent ' + (7 + Number(d)));
+        await sleep(180);
+      }
+    } else if (mode === 'type') {
+      await clearField();
+      await inputChars(digits);
+    } else {
+      // 'paste' / 'paste-popup': clipboard via the Clip Setter app, then paste into box 1
+      await setClipboard(otp);
+      await sleep(900);
+      await tapXY(REGISTER.otpXY, 'OTP box 1');
+      await sleep(300);
+      if (mode === 'paste-popup' && REGISTER.otpPasteXY) {
+        await shell(`input swipe ${x} ${y} ${x} ${y} 600`);   // long-press to open the menu
+        await sleep(600);
+        await tapXY(REGISTER.otpPasteXY, 'Paste chip');
+      } else {
+        await shell('input keyevent 279');                    // KEYCODE_PASTE
+      }
+    }
+
+    if (REGISTER.otpSubmit && REGISTER.otpNextXY) {
+      await sleep(1000);
+      await tapXY(REGISTER.otpNextXY, 'Submit (otp)');
+    }
+    return { step: 'otp', otp, mode };
   },
 
   // Test the keypad: type any digit string on it.
