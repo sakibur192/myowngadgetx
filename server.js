@@ -60,13 +60,16 @@ const REGISTER = {
   pageWaitMs:   1800,          // pause after each page change
 
   // How to put the OTP into the boxed field:
-  //   'button-paste' -> Clip Setter sets clipboard = SMS, then tap the app's Paste BUTTON (otpPasteXY)
-  //   'keys'         -> send each digit as a hardware key event (for split OTP boxes)
+  //   'a11y'         -> Accessibility service fills it as GENUINE input (app accepts it like manual). BEST.
+  //   'a11y-paste'   -> Accessibility service sets clipboard + performs a REAL paste on the field
+  //   'button-paste' -> Clip Setter sets clipboard, then tap the app's Paste BUTTON (otpPasteXY)
+  //   'keys'         -> send each digit as a hardware key event
   //   'paste'        -> Clip Setter sets clipboard, then KEYCODE_PASTE into box 1
-  //   'paste-popup'  -> Clip Setter sets clipboard, long-press box 1, tap the Paste chip (otpPasteXY)
-  //   'type'         -> inputChars via ADB keyboard (usually fails on split boxes)
-  otpMode:      'button-paste',
-  otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (measured on the real phone)
+  //   'type'         -> inputChars via ADB keyboard
+  // 'a11y' needs the Clip Setter app's accessibility service enabled once:
+  //   Settings -> Accessibility -> GadgetX OTP Filler -> On.
+  otpMode:      'a11y',
+  otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (used only in 'button-paste' mode)
   otpSubmit:    false,         // true = also tap otpNextXY after entering the OTP
 };
 
@@ -929,9 +932,22 @@ const actions = {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
     const digits = digitsOnly(otp);
-    const mode = REGISTER.otpMode || 'keys';
+    const mode = REGISTER.otpMode || 'a11y';
     const [x, y] = REGISTER.otpXY;
     log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
+
+    if (mode === 'a11y' || mode === 'a11y-paste') {
+      // Accessibility service fills the OTP field as genuine input (it must be enabled once:
+      // Settings -> Accessibility -> GadgetX OTP Filler). This is treated exactly like a real user.
+      const amMode = mode === 'a11y-paste' ? 'paste' : 'settext';
+      const out = await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es text ${digits} --es mode ${amMode} -p ${CLIP_APP}`);
+      // am broadcast reports delivery; 0 receivers means the service isn't enabled.
+      if (/result=0|Broadcast completed.*result=0/.test(out || '') && !/extras/.test(out || '')) {
+        log('  (a11y) broadcast sent; if nothing filled, enable the OTP Filler accessibility service');
+      }
+      if (REGISTER.otpSubmit && REGISTER.otpNextXY) { await sleep(1200); await tapXY(REGISTER.otpNextXY, 'Submit (otp)'); }
+      return { step: 'otp', otp, mode };
+    }
 
     if (mode === 'button-paste') {
       // Put the SMS/OTP on the clipboard via the Clip Setter app, then tap the app's own
