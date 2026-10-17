@@ -51,7 +51,7 @@ const REGISTER = {
   pinXY:        [540, 934],    // PIN field      = old MOBILE field position
   nextPinXY:    [571, 1365],   // Next (pin)     = measured on the real phone
   otpXY:        [247, 1145],   // OTP paste spot — tap here, then paste the copied SMS
-  otpNextXY:    [784, 1575],   // Final Submit on the OTP page   (measured on the real phone)
+  otpNextXY:    [782, 1713],   // Final Submit on the OTP page   (measured on the real phone)
   pageWaitMs:   1800,          // pause after each page change
 };
 
