@@ -73,8 +73,8 @@ const REGISTER = {
   //   'type'         -> inputChars via ADB keyboard
   // 'a11y' needs the Clip Setter app's accessibility service enabled once:
   //   Settings -> Accessibility -> GadgetX OTP Filler -> On.
-  otpMode:      'a11y-paste',  // accessibility REAL paste (replicates your working manual paste)
-  otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (used only in 'button-paste' mode)
+  otpMode:      'button-paste', // Clip Setter sets clipboard, then tap the app's Paste button — EXACTLY manual
+  otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (measured on the real phone)
   otpSubmit:    false,         // true = also tap otpNextXY after entering the OTP
 };
 
@@ -973,32 +973,37 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: enter the OTP into the boxed field via the agent (genuine input).
-  //   otpMode 'a11y-paste' -> set clipboard = OTP, then a REAL paste into the focused field
-  //   otpMode 'a11y'/'type'-> set the focused field's text directly (ACTION_SET_TEXT)
-  // Both go through the on-device accessibility service, so the app treats it as real.
+  // Step 3: enter the OTP. Modes:
+  //   'button-paste' -> EXACTLY your manual flow: Clip Setter puts the OTP on the clipboard,
+  //                     then the server taps the APP'S OWN Paste button (otpPasteXY). The app's
+  //                     own paste logic fills AND validates, so Confirm activates. DEFAULT.
+  //   'a11y-paste'   -> accessibility ACTION_PASTE (bypasses the app button; app may not validate)
+  //   'a11y'/'type'  -> accessibility ACTION_SET_TEXT with the exact text
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
-    const mode = REGISTER.otpMode || 'a11y-paste';
+    const mode = REGISTER.otpMode || 'button-paste';
     log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
 
-    await tapXY(REGISTER.otpXY, 'OTP field');   // focus the first/only box
-    await sleep(400);
-
-    if (TRANSPORT === 'agent') {
-      // on-device agent accessibility (genuine input)
-      if (mode === 'a11y' || mode === 'type') { await dev.text(otp); }
-      else { await dev.setclip(otp); await sleep(300); await dev.paste(); }
+    if (mode === 'button-paste') {
+      // 1) OTP onto the clipboard (Clip Setter).  2) tap the app's own Paste button — like your hand.
+      if (!REGISTER.otpPasteXY) throw new Error('Set REGISTER.otpPasteXY to the app Paste button coordinate');
+      await dev.setclip(otp);
+      await sleep(900);                                    // let the clipboard set + return to the app
+      await tapXY(REGISTER.otpPasteXY, 'app Paste button');
     } else {
-      // adb: drive the Clip Setter accessibility service (genuine paste), as we were testing
-      if (mode === 'a11y' || mode === 'type') {
+      await tapXY(REGISTER.otpXY, 'OTP field');            // focus the field first for the a11y paths
+      await sleep(400);
+      if (TRANSPORT === 'agent') {
+        if (mode === 'a11y' || mode === 'type') { await dev.text(otp); }
+        else { await dev.setclip(otp); await sleep(300); await dev.paste(); }
+      } else if (mode === 'a11y' || mode === 'type') {
         const b64 = Buffer.from(otp, 'utf8').toString('base64');
         await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es b64 ${b64} --es mode settext -p ${CLIP_APP}`);
       } else {
-        await setClipboard(otp);                 // Clip Setter puts the exact text on the clipboard
+        await setClipboard(otp);
         await sleep(700);
-        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es mode paste -p ${CLIP_APP}`); // REAL paste
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es mode paste -p ${CLIP_APP}`);
       }
     }
 
