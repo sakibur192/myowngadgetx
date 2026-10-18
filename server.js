@@ -1093,8 +1093,8 @@ const COORDS = {
     number1Open:  [317, 718],   // tap to open the "number 1" box
     number1Field: [249, 492],   // the "number 1" box itself (tap to focus, then type)
 
-    number2Open:  [963, 459],   // tap to open the "number 2" box
-    number2Field: [193, 527],   // the "number 2" box itself (tap to focus, then type)
+    number2Open:  [963, 459],   // tap this to LEAVE page 1 and open the NUMBER 2 page
+    number2Field: [193, 527],   // the "number 2" box on that new page (tap to focus, then type)
     number2Confirm: [955, 481], // tap right after typing number 2
 
     numbersNext: [599, 1366],   // button that submits both numbers -> next page
@@ -1179,8 +1179,9 @@ async function flowLogin({ pin } = {}) {
 }
 
 // GO ONE (used by both goonesend and gooneout — only the first tap is different).
-// Steps: open number1 -> type number1 -> open number2 -> type number2 ->
-//        confirm -> next -> type PIN -> next -> hold 4s -> final tap.
+// Pages:  page 1 has NUMBER 1  ->  a tap opens the NUMBER 2 page  ->  then PIN page -> etc.
+// Steps:  entry -> type number1 -> go to page 2 (WAIT) -> type number2 -> confirm ->
+//         next -> type PIN -> next -> hold 4s -> final tap.
 async function flowGoOne({ number1, number2, pin, entry, label }) {
   const n1 = String(number1 ?? '');
   const n2 = String(number2 ?? '');
@@ -1194,25 +1195,31 @@ async function flowGoOne({ number1, number2, pin, entry, label }) {
   await tap(entry[0], entry[1], 'entry');
   await wait(PAUSE.afterPage);
 
-  // 2) number 1 — open the box, focus it, type it in (exactly, in order)
+  // 2) NUMBER 1 is on THIS page — open its box, focus it, type the number in
   await openAndType(C.number1Open, C.number1Field, n1, 'number1');
 
-  // 3) number 2 — open the box, focus it, type it in, then confirm
-  await openAndType(C.number2Open, C.number2Field, n2, 'number2');
+  // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — wait for the new page to load
+  await tap(C.number2Open[0], C.number2Open[1], 'go to number2 page');
+  await wait(PAUSE.afterPage);
+
+  // 4) NUMBER 2 page — focus its box, type the number in, then confirm
+  await tap(C.number2Field[0], C.number2Field[1], 'focus number2');
+  await typeInBox(n2);
+  await wait(PAUSE.afterType);
   await tap(C.number2Confirm[0], C.number2Confirm[1], 'confirm number2');
 
-  // 4) submit both numbers -> next page
+  // 5) submit both numbers -> next page
   await tap(C.numbersNext[0], C.numbersNext[1], 'numbers next');
   await wait(PAUSE.afterPage);
 
-  // 5) PIN on the next page
+  // 6) PIN on the next page
   await tap(C.pinField[0], C.pinField[1], 'PIN box');
   await typePin(pin);
   await wait(PAUSE.afterType);
   await tap(C.pinNext[0], C.pinNext[1], 'PIN next');
   await wait(PAUSE.afterPage);
 
-  // 6) press and hold, then the final tap
+  // 7) press and hold, then the final tap
   await longPress(C.holdSpot[0], C.holdSpot[1], C.holdSeconds, 'hold');
   await wait(PAUSE.afterPage);
   await tap(C.finalTap[0], C.finalTap[1], 'final');
@@ -1278,7 +1285,7 @@ async function flowInput1({ number1 } = {}) {
   const n1 = String(number1 ?? '');
   if (!n1.trim()) throw new Error('input1: number1 is required');
   log('FLOW input1 number1=' + n1);
-  await openLongPressPaste(COORDS.goone.number1Open, COORDS.goone.number1Field, n1, 'number1');
+  await openAndType(COORDS.goone.number1Open, COORDS.goone.number1Field, n1, 'number1');
   return { flow: 'input1', number1: n1 };
 }
 
