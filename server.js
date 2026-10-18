@@ -43,8 +43,8 @@ const CLIP_APP = 'com.baybex.clipsetter';
 // Forward every incoming SMS to a Telegram chat, so you copy the OTP FROM TELEGRAM (which
 // the app accepts) and paste it. Fill both to enable. Token from @BotFather; chat id from
 // @userinfobot (your own id) or the group's id.
-const TELEGRAM_BOT_TOKEN = '8786603241:AAEheZP1dMK6OMtKb9KhBhggrVoegIZJOa0';   // e.g. '1234567:AAE...'
-const TELEGRAM_CHAT_ID   = '1942142052';   // e.g. '123456789'
+const TELEGRAM_BOT_TOKEN = '';   // e.g. '1234567:AAE...'
+const TELEGRAM_CHAT_ID   = '';   // e.g. '123456789'
 const CLIP_ACTIVITY = CLIP_APP + '/.ClipActivity';
 
 // The number your app's OTP SMS comes from (used to pick the right SMS)
@@ -723,7 +723,12 @@ function extractOtp(message) {
 function forwardToTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
-    const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: String(text || '').slice(0, 4000) });
+    // Forward the SMS EXACTLY as received — do NOT collapse whitespace or trim.
+    // The OTP field keys on the original line break; turning it into a space breaks the paste.
+    const clean = String(text || '')
+      .replace(/[​-‍﻿ ]/g, '')   // zero-width + non-breaking spaces
+      .slice(0, 4000);   // keep the SMS as-is (newline included); only remove zero-width junk + cap length
+    const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: clean });
     const u = new URL(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`);
     const req = https.request(
       { method: 'POST', hostname: u.hostname, path: u.pathname + u.search,
@@ -1004,8 +1009,11 @@ const actions = {
   //   'a11y-paste'   -> accessibility ACTION_PASTE (bypasses the app button; app may not validate)
   //   'a11y'/'type'  -> accessibility ACTION_SET_TEXT with the exact text
   'reg-otp': async ({ code, message, text }) => {
-    const otp = String(code ?? message ?? text ?? '').trim();
-    if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
+    // A bare code is trimmed; a full SMS is kept EXACTLY as-is (line break included) so the
+    // clipboard carries what the phone received, byte-for-byte.
+    const raw = String(code ?? message ?? text ?? '');
+    const otp = code != null ? raw.trim() : raw;
+    if (!otp.trim()) throw new Error('No OTP text sent — paste the OTP in the box first');
     const mode = REGISTER.otpMode || 'button-paste';
     log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
 
@@ -1209,7 +1217,8 @@ app.post('/api/sms', (req, res) => {
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
   log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
-  forwardToTelegram(sms.message);          // -> appears in Telegram; copy from there and paste
+  // Send the FULL SMS (cleaned of trailing whitespace / zero-width junk so the paste works).
+  forwardToTelegram(sms.message);
   const otp = digitsOnly(sms.message);
 
   if (awaitingOtpUntil && Date.now() < awaitingOtpUntil) {
@@ -1380,7 +1389,7 @@ textarea{resize:vertical;min-height:52px}
     <div class="card">
       <h2>OTP</h2>
       <div class="inline">
-        <input id="otp" type="text" placeholder="Paste the SMS text or just the code">
+        <textarea id="otp" rows="3" placeholder="Paste the SMS (keeps line breaks) or just the code" style="font:inherit;white-space:pre-wrap;resize:vertical"></textarea>
         <button class="btn go" onclick="sendOtp()">Fill OTP</button>
       </div>
       <p class="hint">Forwarded SMS also arrive automatically at /api/sms.</p>
@@ -1471,7 +1480,7 @@ async function loadApps(){
 }
 function key(k){call('key',{key:k});}
 function sendText(){const t=$('text').value;if(t==='')return;call('paste',{text:t});}
-function sendOtp(){const v=$('otp').value.trim();if(!v)return;call('otp',/^\\d{4,8}$/.test(v)?{code:v}:{message:v});}
+function sendOtp(){const raw=$('otp').value;if(raw.trim()==='')return;call('otp',/^\\d{4,8}$/.test(raw.trim())?{code:raw.trim()}:{message:raw});}
 function app(a){const p=$('pkg').value;localStorage.setItem('rpkg',p);call(a,{package:p});}
 function regMobile(){call('reg-mobile',{mobile:$('rmobile').value.trim()});}
 function regPin(){call('reg-pin',{pin:$('rpin').value.trim()});}
@@ -1530,8 +1539,8 @@ button:disabled{opacity:.5;cursor:default}
   <div class="card locked" id="c3">
     <div class="step">Step 3 — OTP</div>
     <p class="hint">Paste the OTP (or whole SMS) and send it to the phone. It shows up in the <b>OTP Viewer</b> app on the phone — copy it there by hand and paste into GadgetX by hand.</p>
-    <input id="otp" type="text" placeholder="Paste the OTP / SMS here" inputmode="text">
-    <button id="b3" onclick="doStep(3,'/api/sms',()=>({message:v('otp')}))">Send to phone</button>
+    <textarea id="otp" rows="3" placeholder="Paste the OTP / SMS here (keeps line breaks)" style="width:100%;font:inherit;white-space:pre-wrap;resize:vertical"></textarea>
+    <button id="b3" onclick="doStep(3,'/api/sms',()=>({message:vraw('otp')}))">Send to phone</button>
     <div class="msg" id="m3"></div>
   </div>
 
@@ -1542,6 +1551,7 @@ var K='${API_KEY}';
 var SKEY='gxflow';            // saved wizard progress (survives tab reloads when app-switching)
 function $(i){return document.getElementById(i)}
 function v(i){return $(i).value.trim()}
+function vraw(i){return $(i).value}
 function unlock(n){$('c'+n).classList.remove('locked')}
 function lock(n){$('c'+n).classList.add('locked')}
 
