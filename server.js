@@ -1219,6 +1219,7 @@ async function flowGoOne({ number1, number2, pin, entry, label }) {
 
   // 2) NUMBER 1 is on THIS page — open its box, focus it, type the number in
   await openAndType(C.number1Open, C.number1Field, n1, 'number1');
+  await wait(1000);   // after number1 is typed, wait 1s for the new page to load fully
 
   // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — wait for the new page to load
   await tap(C.number2Open[0], C.number2Open[1], 'go to number2 page');
