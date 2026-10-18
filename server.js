@@ -39,6 +39,12 @@ const ADB_KEYBOARD_URL = 'https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKe
 // Clipboard helper app (android-build/clip-setter). This ROM blocks `cmd clipboard`, so
 // the server launches this tiny app to put the OTP on the phone's clipboard, then pastes.
 const CLIP_APP = 'com.baybex.clipsetter';
+
+// Forward every incoming SMS to a Telegram chat, so you copy the OTP FROM TELEGRAM (which
+// the app accepts) and paste it. Fill both to enable. Token from @BotFather; chat id from
+// @userinfobot (your own id) or the group's id.
+const TELEGRAM_BOT_TOKEN = '8786603241:AAEheZP1dMK6OMtKb9KhBhggrVoegIZJOa0';   // e.g. '1234567:AAE...'
+const TELEGRAM_CHAT_ID   = '1942142052';   // e.g. '123456789'
 const CLIP_ACTIVITY = CLIP_APP + '/.ClipActivity';
 
 // The number your app's OTP SMS comes from (used to pick the right SMS)
@@ -713,6 +719,24 @@ function extractOtp(message) {
   return m ? m[1] : null;
 }
 
+// Send the SMS to a Telegram chat (so you copy the OTP from Telegram — the app accepts that).
+function forwardToTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: String(text || '').slice(0, 4000) });
+    const u = new URL(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`);
+    const req = https.request(
+      { method: 'POST', hostname: u.hostname, path: u.pathname + u.search,
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } },
+      (r) => { let b = ''; r.on('data', (d) => (b += d)); r.on('end', () => {
+        if (r.statusCode !== 200) log('[telegram] HTTP ' + r.statusCode + ' ' + b.slice(0, 160));
+      }); }
+    );
+    req.on('error', (e) => log('[telegram] ' + e.message));
+    req.write(payload); req.end();
+  } catch (e) { log('[telegram] ' + e.message); }
+}
+
 function smsMatches(s, f) {
   if (s.used) return false;
   if (f.from && !s.from.toLowerCase().includes(String(f.from).toLowerCase())) return false;
@@ -1185,6 +1209,7 @@ app.post('/api/sms', (req, res) => {
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
   log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
+  forwardToTelegram(sms.message);          // -> appears in Telegram; copy from there and paste
   const otp = digitsOnly(sms.message);
 
   if (awaitingOtpUntil && Date.now() < awaitingOtpUntil) {
