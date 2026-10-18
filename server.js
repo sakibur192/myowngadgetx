@@ -1091,11 +1091,14 @@ const FLOWS = {
 
 // Long-press a field and paste the given value EXACTLY as-is (clipboard → KEYCODE_PASTE),
 // mirroring the manual "long-press → Paste" action. Nothing is trimmed or altered.
-async function longPressPaste(xy, value, label) {
+// Set the clipboard FIRST (Clip Setter briefly comes to front and returns), THEN open the field
+// and long-press and paste — so NO app-switch happens after the field is opened/focused.
+async function longPressPaste(fieldXY, value, label, openXY) {
   await dev.setclip(String(value ?? ''));
-  await sleep(900);                                        // clipboard set + return to the app
-  log('  long-press+paste ' + label + ' (' + xy[0] + ',' + xy[1] + ')');
-  await dev.longpress(xy[0], xy[1], 700);
+  await sleep(900);                                        // clipboard set + Clip Setter returns to the app
+  if (openXY) { await tapXY(openXY, label + ': open field'); await sleep(400); }
+  log('  long-press+paste ' + label + ' (' + fieldXY[0] + ',' + fieldXY[1] + ')');
+  await dev.longpress(fieldXY[0], fieldXY[1], 700);
   await sleep(500);
   await dev.paste();                                       // paste clipboard into the focused field
   await sleep(300);
@@ -1142,12 +1145,10 @@ async function flowGoOne({ number1, number2, pin, entryXY, label }) {
   log('FLOW ' + label + ' n1=' + n1 + ' n2=' + n2);
   await tapXY(entryXY, label + ': entry');
   await sleep(FLOWS.pageWaitMs);
-  await tapXY(G.num1OpenXY, label + ': open number1');     // tap 243,507 first
-  await sleep(400);
-  await longPressPaste(G.num1XY, n1, 'number1');           // then long-press + paste number1 as-is
-  await tapXY(G.toNum2XY, label + ': to number2');
-  await sleep(500);
-  await longPressPaste(G.num2XY, n2, 'number2');           // paste number2 as-is (ends with a 300ms wait)
+  // Number1: clipboard set FIRST, THEN tap 287,759 to open, long-press 289,739, paste.
+  await longPressPaste(G.num1XY, n1, 'number1', G.num1OpenXY);
+  // Number2: clipboard set FIRST, THEN tap 963,459 to open, long-press 193,527, paste.
+  await longPressPaste(G.num2XY, n2, 'number2', G.toNum2XY);
   await tapXY(G.afterNum2XY, label + ': after number2');   // tap 955,481 to select/confirm number2
   await sleep(400);
   await tapXY(G.submitNumsXY, label + ': submit numbers');
