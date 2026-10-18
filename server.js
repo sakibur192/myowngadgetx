@@ -1242,12 +1242,27 @@ async function flowGoOneCheck() {
   };
 }
 
-// Make each flow callable as POST /api/<name> (login, goonesend, gooneout, gooncheck).
+// INPUT1 only — test the "number 1" box on its own: open it, focus it, type the number.
+// (Starts from the number1 box; it does NOT tap the entry button first.)
+async function flowInput1({ number1 } = {}) {
+  const n1 = String(number1 ?? '');
+  if (!n1.trim()) throw new Error('input1: number1 is required');
+  const C = COORDS.goone;
+  log('FLOW input1 number1=' + n1);
+  await tap(C.number1Open[0],  C.number1Open[1],  'open number1');
+  await tap(C.number1Field[0], C.number1Field[1], 'focus number1');
+  await typeInBox(n1);
+  await wait(PAUSE.afterType);
+  return { flow: 'input1', number1: n1 };
+}
+
+// Make each flow callable as POST /api/<name> (login, goonesend, gooneout, gooncheck, input1).
 Object.assign(actions, {
   login:     flowLogin,
   goonesend: flowGoOneSend,
   gooneout:  flowGoOneOut,
   gooncheck: flowGoOneCheck,
+  input1:    flowInput1,
 });
 
 // ---------------------------- HTTP ----------------------------
@@ -1961,6 +1976,14 @@ button:disabled{opacity:.5;cursor:default}
     <h2>Check</h2>
     <button id="bcheck" onclick="run('gooncheck','bcheck',{},'cmsg')">Check Row</button>
     <div class="msg" id="cmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Input 1 (test)</h2>
+    <label>Number 1</label>
+    <input id="i1" placeholder="Number 1">
+    <button id="binput1" onclick="run('input1','binput1',{number1:raw('i1')},'i1msg')">Type into box 1</button>
+    <div class="msg" id="i1msg"></div>
   </div>
 </div>
 <script>
