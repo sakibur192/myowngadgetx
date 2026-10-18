@@ -1171,8 +1171,17 @@ async function flowGoOneCheck() {
   const y = C.rowXY[1];
   const rowNodes = nodes.filter((n) => n.text && n.bounds[1] <= y && y <= n.bounds[3]);
   const rowText = rowNodes.map((n) => n.text).join(' ').trim();
+  // Pull just the number out of the row (drop ৳/currency symbols, thousands commas).
+  const rowJoined = rowNodes.map((n) => n.text).join(' ').replace(/,/g, '');
+  let m = rowJoined.match(/-?\d+(?:\.\d+)?/);
+  if (!m) {
+    const allJoined = nodes.filter((n) => n.text).map((n) => n.text).join(' ').replace(/,/g, '');
+    m = allJoined.match(/-?\d+(?:\.\d+)?/);
+  }
+  const number = m ? m[0] : '';
   return {
     flow: 'gooncheck',
+    number,                                         // the balance/number only, e.g. "62.65"
     rowText,
     row: rowNodes.map((n) => ({ text: n.text, bounds: n.bounds })),
     allText: nodes.filter((n) => n.text).map((n) => n.text),
@@ -1913,7 +1922,7 @@ function run(action,btnId,body,msgId){
       if(j.ok){
         m.className='msg ok';
         var r=j.result||{};
-        if(r.rowText!==undefined){ m.innerHTML='<span class="big">'+esc(r.rowText||'(no text found)')+'</span>\\n'+esc(JSON.stringify(r.allText||[])); }
+        if(r.number!==undefined){ m.innerHTML='<span class="big">'+esc(r.number||'(not found)')+'</span>'; }
         else if(r.flow==='login'){ m.textContent=(r.success?'\\u2713 Login success':'\\u2717 No screen change (check PIN)')+'  ['+r.before+' \\u2192 '+r.after+']'; }
         else{ m.textContent='\\u2713 '+JSON.stringify(r); }
       } else { m.className='msg err'; m.textContent='\\u2717 '+(j.error||'failed'); }
