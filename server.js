@@ -655,6 +655,7 @@ async function selectAll() {
 async function tapXY(xy, labelStr) {
   log('  tap ' + labelStr + ' (' + xy[0] + ',' + xy[1] + ')');
   await dev.tap(xy[0], xy[1]);
+  await sleep(100);                 // settle: give every tap a chance to register
 }
 
 // Keep only digits (for PIN / OTP typed on the numeric keypad).
