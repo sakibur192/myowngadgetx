@@ -1086,25 +1086,33 @@ const COORDS = {
     openPin: [499, 1070],   // tap to open the PIN box
     submit:  [596, 1401],   // the Login button
   },
+  // ===== GO ONE flow — the taps run in THIS order. To move a button, just edit its [x, y]. =====
   goone: {
-    entrySend: [187, 989],  // goonesend: the very first tap
-    entryOut:  [443, 999],  // gooneout:  the very first tap
+    entrySend: [187, 989],      // STEP 1 (goonesend): the very first tap
+    entryOut:  [443, 999],      // STEP 1 (gooneout):  the very first tap
 
-    number1Open:  [317, 718],   // tap to open the "number 1" box
-    number1Field: [249, 492],   // the "number 1" box itself (tap to focus, then type)
+    // -- PAGE 1 : NUMBER 1 --
+    number1Open:   [317, 718],  // STEP 2a: tap to open the number 1 box
+    number1Field:  [249, 492],  // STEP 2b: tap this box to focus it, then it types number 1
 
-    number2Open:  [963, 459],   // tap this to LEAVE page 1 and open the NUMBER 2 page
-    number2Field: [342, 541],   // the "number 2" box on that new page (long-press to focus, then type)
-    number2Confirm: [955, 481], // tap right after typing number 2
+    // -- go to the NUMBER 2 page --
+    number2Open:   [963, 459],  // STEP 3 : tap this to open the number 2 page (then it waits)
 
-    numbersNext: [599, 1366],   // button that submits both numbers -> next page
+    // -- PAGE 2 : NUMBER 2 --
+    number2PageTap: [248, 713], // STEP 4a: first tap on the number 2 page
+    number2Field:   [301, 503], // STEP 4b: long-press this box to focus, then it types number 2
+    number2Confirm: [955, 481], // STEP 4c: tap right after number 2
 
-    pinField:  [597, 1392],     // PIN box on the next page
-    pinNext:   [562, 1406],     // button that submits the PIN -> next page
+    numbersNext:   [599, 1366], // STEP 5 : submit both numbers -> next page
 
-    holdSpot:    [574, 1628],   // press and hold here...
-    holdSeconds: 4,             // ...for this many seconds
-    finalTap:    [614, 2242],   // the last tap
+    // -- PIN page --
+    pinField:  [597, 1392],     // STEP 6a: tap the PIN box, then it types the PIN
+    pinNext:   [562, 1406],     // STEP 6b: submit the PIN -> next page
+
+    // -- final --
+    holdSpot:    [574, 1628],   // STEP 7a: press and hold here...
+    holdSeconds: 4,             // STEP 7a: ...for this many seconds
+    finalTap:    [614, 2242],   // STEP 7b: the last tap
   },
   check: {
     row: [268, 653],            // gooncheck: tap this row, then read its text
@@ -1114,9 +1122,11 @@ const COORDS = {
 // How long to pause at different moments, in milliseconds. Raise these if the
 // phone is slow and a tap happens before the screen is ready.
 const PAUSE = {
-  afterTap:  150,    // small settle after every single tap
-  afterType: 400,    // after typing into a box
-  afterPage: 1800,   // after a whole new page loads
+  afterTap:        150,    // small settle after every single tap
+  afterType:       400,    // after typing into a box
+  afterPage:       1800,   // after a whole new page loads
+  afterNumber1:    1000,   // extra wait after number 1 is typed (lets the page settle)
+  number2PageLoad: 2000,   // wait for the NUMBER 2 page to load before touching it
 };
 
 // ---- tiny helpers: each one does ONE obvious thing --------------------------
@@ -1219,13 +1229,14 @@ async function flowGoOne({ number1, number2, pin, entry, label }) {
 
   // 2) NUMBER 1 is on THIS page — open its box, focus it, type the number in
   await openAndType(C.number1Open, C.number1Field, n1, 'number1');
-  await wait(1000);   // after number1 is typed, wait 1s for the new page to load fully
+  await wait(PAUSE.afterNumber1);   // let the page settle after number 1
 
-  // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — wait 2s for it to load fully
+  // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — then wait for it to load
   await tap(C.number2Open[0], C.number2Open[1], 'go to number2 page');
-  await wait(2000);
+  await wait(PAUSE.number2PageLoad);
 
-  // 4) NUMBER 2 page — long-press the box to focus, type the number in, then confirm
+  // 4) NUMBER 2 page — tap it first, long-press the box to focus, type the number, then confirm
+  await tap(C.number2PageTap[0], C.number2PageTap[1], 'number2 first tap');
   await longPress(C.number2Field[0], C.number2Field[1], 1, 'focus number2');
   await typeInBox(n2);
   await wait(PAUSE.afterType);
