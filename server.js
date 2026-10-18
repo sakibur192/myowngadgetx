@@ -1206,6 +1206,13 @@ app.get('/api/sms', (req, res) => {
   res.json({ ok: true, sms: smsLog.slice(0, 20).map(({ ts, ...s }) => s) });
 });
 
+// Latest forwarded SMS (for the OTP Viewer app on the target phone to poll).
+app.get('/api/last-sms', (req, res) => {
+  const s = smsLog[0];
+  if (!s) return res.json({ ok: true, has: false });
+  res.json({ ok: true, has: true, id: s.ts, from: s.from, message: s.message, otp: s.otp, at: s.at });
+});
+
 // Run a list of steps in order, e.g. { "steps": [ { "action": "tap-element", "text": "Login" }, ... ] }
 app.post('/api/run', async (req, res) => {
   const steps = Array.isArray(req.body?.steps) ? req.body.steps : null;
@@ -1497,9 +1504,9 @@ button:disabled{opacity:.5;cursor:default}
 
   <div class="card locked" id="c3">
     <div class="step">Step 3 — OTP</div>
-    <p class="hint">Paste the OTP (or the whole SMS) in the box and submit. The server puts it on the phone's clipboard, taps Paste, and submits. Your place is saved if you switch apps.</p>
+    <p class="hint">Paste the OTP (or whole SMS) and send it to the phone. It shows up in the <b>OTP Viewer</b> app on the phone — copy it there by hand and paste into GadgetX by hand.</p>
     <input id="otp" type="text" placeholder="Paste the OTP / SMS here" inputmode="text">
-    <button id="b3" onclick="doStep(3,'/api/reg-otp',()=>({code:v('otp')}))">Submit OTP</button>
+    <button id="b3" onclick="doStep(3,'/api/sms',()=>({message:v('otp')}))">Send to phone</button>
     <div class="msg" id="m3"></div>
   </div>
 
@@ -1532,7 +1539,7 @@ function restore(){
     // jump straight to where we left off (the OTP step after an app-switch)
     const card=$('c'+step);
     if(card){card.scrollIntoView({block:'center'});}
-    if(step===3)$('m3').innerHTML='<span class=ok>Back on the OTP step. Paste the OTP/SMS below and submit.</span>';
+    if(step===3)$('m3').innerHTML='<span class=ok>Back on the OTP step. Paste the OTP/SMS and send it to the phone.</span>';
   }
 }
 
@@ -1557,7 +1564,7 @@ async function doStep(n,path,body){
       if(n===1)s.mobile=v('mobile');
       if(n===2)s.pin=v('pin');
       if(n<3){unlock(n+1);s.step=n+1;saveState(s);}
-      else{s.step=3;saveState(s);m.innerHTML='<span class=ok>&#10003; OTP submitted</span>';}
+      else{s.step=3;saveState(s);m.innerHTML='<span class=ok>&#10003; Sent to the phone. Open OTP Viewer on the phone, Copy it, then paste into GadgetX by hand.</span>';}
     }else{
       m.innerHTML='<span class=err>&#10007; '+(j.error||'failed')+'</span>';btn.disabled=false;
     }
