@@ -1281,13 +1281,27 @@ async function flowInput1({ number1 } = {}) {
   return { flow: 'input1', number1: n1 };
 }
 
-// Make each flow callable as POST /api/<name> (login, goonesend, gooneout, gooncheck, input1).
+// SHOW TAP MARKS — turn Android's on-screen touch markers on or off.
+// When ON you can watch exactly where each automated tap lands:
+//   • "pointer location" draws a crosshair + shows the live X,Y at the top of the screen
+//   • "show touches" draws a circle at every touch (including our injected taps)
+// Use it to debug a wrong coordinate: turn it on, run a flow, watch the marks.
+async function flowShowTouches({ on = true } = {}) {
+  const v = on ? 1 : 0;
+  await shell(`settings put system pointer_location ${v}`);   // crosshair + X,Y readout
+  await shell(`settings put system show_touches ${v}`);       // circle at each touch
+  log('tap marks ' + (on ? 'ON' : 'OFF'));
+  return { tapMarks: !!on };
+}
+
+// Make each flow callable as POST /api/<name>.
 Object.assign(actions, {
-  login:     flowLogin,
-  goonesend: flowGoOneSend,
-  gooneout:  flowGoOneOut,
-  gooncheck: flowGoOneCheck,
-  input1:    flowInput1,
+  login:         flowLogin,
+  goonesend:     flowGoOneSend,
+  gooneout:      flowGoOneOut,
+  gooncheck:     flowGoOneCheck,
+  input1:        flowInput1,
+  'show-touches': flowShowTouches,
 });
 
 // ---------------------------- HTTP ----------------------------
@@ -2009,6 +2023,16 @@ button:disabled{opacity:.5;cursor:default}
     <input id="i1" placeholder="Number 1">
     <button id="binput1" onclick="run('input1','binput1',{number1:raw('i1')},'i1msg')">Type into box 1</button>
     <div class="msg" id="i1msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Show tap marks</h2>
+    <p class="sub">Turn ON to see a crosshair + X,Y and a circle at every tap on the phone — use it to check where taps really land.</p>
+    <div class="row2">
+      <button id="btmon"  onclick="run('show-touches','btmon',{on:true},'tmmsg')">Marks ON</button>
+      <button id="btmoff" onclick="run('show-touches','btmoff',{on:false},'tmmsg')">Marks OFF</button>
+    </div>
+    <div class="msg" id="tmmsg"></div>
   </div>
 </div>
 <script>
