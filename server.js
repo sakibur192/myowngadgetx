@@ -1060,143 +1060,189 @@ const actions = {
   },
 };
 
-// ======================= extra flows: login / goone send+out / check =======================
-// All coordinates are device pixels (measured on the real phone). CHANGE here if the UI moves.
-// Each flow is a plain async function so any future caller can invoke it directly; they are
-// also exposed as POST /api/<name> actions (login, goonesend, gooneout, gooncheck) below.
-const FLOWS = {
-  pageWaitMs: 1800,                 // pause after each page change
+// =============================================================================
+//  EXTRA FLOWS:  login  /  goonesend  /  gooneout  /  gooncheck
+//
+//  Read each flow top-to-bottom like a checklist. The helpers are named in
+//  plain English so a beginner can follow along:
+//
+//      tap(x, y, "name")        -> tap once at the point (x, y)
+//      longPress(x, y, secs)    -> press and hold at (x, y) for `secs` seconds
+//      typePin("1234")          -> type a PIN on the on-screen number keypad
+//      typeInBox("017...")      -> type text into the box that is focused now
+//      wait(ms)                 -> pause for `ms` milliseconds
+//      screenName()             -> the name of the screen showing right now
+//
+//  To move a button, change ONLY the numbers in COORDS below. Nothing else.
+//
+//  IMPORTANT: numbers are TYPED, not pasted. Pasting needs the Clip Setter app,
+//  which jumps to the front and steals focus from GadgetX, so the taps that
+//  follow land on the wrong app. Typing keeps GadgetX in front the whole time.
+// =============================================================================
+
+// Every coordinate these flows use, in one place. Each is [x, y] in screen pixels.
+const COORDS = {
   login: {
-    openXY:   [499, 1070],          // tap first (opens / focuses the PIN entry)
-    submitXY: [596, 1401],          // login button
+    openPin: [499, 1070],   // tap to open the PIN box
+    submit:  [596, 1401],   // the Login button
   },
   goone: {
-    sendEntryXY: [187, 989],        // /goonesend : first tap
-    outEntryXY:  [443, 999],        // /gooneout  : first tap
-    num1OpenXY:  [287, 759],         // tap first to open the number1 input
-    num1XY:      [289, 739],         // then long-press here + paste number1
-    toNum2XY:    [963, 459],         // tap before number2
-    num2XY:      [193, 527],         // long-press + paste number2
-    afterNum2XY: [955, 481],         // tap after pasting number2 (select/confirm it)
-    submitNumsXY:[599, 1366],        // submit the two numbers
-    pinFieldXY:  [597, 1392],        // (after page change) PIN field
-    pinSubmitXY: [562, 1406],        // submit the PIN
-    holdXY:      [574, 1628],        // (after page change) long-press 4s here
-    holdMs:      4000,
-    finalXY:     [614, 2242],        // (after page change) final tap
+    entrySend: [187, 989],  // goonesend: the very first tap
+    entryOut:  [443, 999],  // gooneout:  the very first tap
+
+    number1Open:  [287, 759],   // tap to open the "number 1" box
+    number1Field: [289, 739],   // the "number 1" box itself (tap to focus, then type)
+
+    number2Open:  [963, 459],   // tap to open the "number 2" box
+    number2Field: [193, 527],   // the "number 2" box itself (tap to focus, then type)
+    number2Confirm: [955, 481], // tap right after typing number 2
+
+    numbersNext: [599, 1366],   // button that submits both numbers -> next page
+
+    pinField:  [597, 1392],     // PIN box on the next page
+    pinNext:   [562, 1406],     // button that submits the PIN -> next page
+
+    holdSpot:    [574, 1628],   // press and hold here...
+    holdSeconds: 4,             // ...for this many seconds
+    finalTap:    [614, 2242],   // the last tap
   },
   check: {
-    rowXY: [268, 653],               // /gooncheck : tap this row, return its text
+    row: [268, 653],            // gooncheck: tap this row, then read its text
   },
 };
 
-// Long-press a field and paste the given value EXACTLY as-is (clipboard → KEYCODE_PASTE),
-// mirroring the manual "long-press → Paste" action. Nothing is trimmed or altered.
-// Set the clipboard FIRST (Clip Setter briefly comes to front and returns), THEN open the field
-// and long-press and paste — so NO app-switch happens after the field is opened/focused.
-async function longPressPaste(fieldXY, value, label, openXY) {
-  await dev.setclip(String(value ?? ''));
-  await sleep(900);                                        // clipboard set + Clip Setter returns to the app
-  if (openXY) { await tapXY(openXY, label + ': open field'); await sleep(400); }
-  log('  long-press+paste ' + label + ' (' + fieldXY[0] + ',' + fieldXY[1] + ')');
-  await dev.longpress(fieldXY[0], fieldXY[1], 700);
-  await sleep(500);
-  await dev.paste();                                       // paste clipboard into the focused field
-  await sleep(300);
+// How long to pause at different moments, in milliseconds. Raise these if the
+// phone is slow and a tap happens before the screen is ready.
+const PAUSE = {
+  afterTap:  150,    // small settle after every single tap
+  afterType: 400,    // after typing into a box
+  afterPage: 1800,   // after a whole new page loads
+};
+
+// ---- tiny helpers: each one does ONE obvious thing --------------------------
+
+// Pause for a number of milliseconds.
+function wait(ms) { return sleep(ms); }
+
+// Tap once, then wait a moment so the tap has time to register.
+async function tap(x, y, name) {
+  log('  tap ' + (name || '') + ' (' + x + ',' + y + ')');
+  await dev.tap(x, y);
+  await wait(PAUSE.afterTap);
 }
 
-// Watch the foreground screen and report whether it changed (used as a success signal).
-async function waitScreenChange(before, timeoutMs) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    await sleep(500);
-    const now = await currentScreen().catch(() => null);
-    if (now && now.name && now.name !== before.name) return { changed: true, before: before.name, after: now.name };
-  }
-  const now = await currentScreen().catch(() => before);
-  return { changed: now.name !== before.name, before: before.name, after: now.name };
+// Press and hold at a point for a number of seconds.
+async function longPress(x, y, seconds, name) {
+  log('  hold ' + (name || '') + ' (' + x + ',' + y + ') for ' + seconds + 's');
+  await dev.longpress(x, y, seconds * 1000);
+  await wait(PAUSE.afterTap);
 }
 
-// /login — a PIN is given. Tap to open, enter the PIN on the keypad (per-digit XY), submit.
-// A screen change = login success.
+// Type a PIN by tapping each digit's button on the on-screen number keypad.
+async function typePin(pin) { await tapPad(digitsOnly(pin)); }
+
+// Type text straight into whatever box is focused right now (no clipboard).
+async function typeInBox(value) { await dev.text(String(value ?? '')); }
+
+// The name of the screen (Activity) in front right now.
+async function screenName() { const s = await currentScreen().catch(() => null); return s ? s.name : '?'; }
+
+// ---- the flows --------------------------------------------------------------
+
+// LOGIN: a PIN is given. Open the PIN box, type the PIN, tap Login.
+// If the screen name changes afterwards, the login worked.
 async function flowLogin({ pin } = {}) {
-  const p = digitsOnly(pin);
-  if (!p) throw new Error('login: no PIN provided');
-  const F = FLOWS.login;
+  if (!digitsOnly(pin)) throw new Error('login: please provide a PIN');
+  const C = COORDS.login;
   log('FLOW login');
-  const before = await currentScreen().catch(() => ({ name: '?' }));
-  await tapXY(F.openXY, 'login: open / PIN field');
-  await sleep(600);
-  await tapPad(p);                                         // PIN by tapping each digit's XY
-  await sleep(400);
-  await tapXY(F.submitXY, 'login: submit');
-  const sc = await waitScreenChange(before, FLOWS.pageWaitMs * 4);
-  return { flow: 'login', success: sc.changed, screenChanged: sc.changed, before: sc.before, after: sc.after };
+  const before = await screenName();
+
+  await tap(C.openPin[0], C.openPin[1], 'open PIN');
+  await typePin(pin);
+  await wait(PAUSE.afterType);
+  await tap(C.submit[0], C.submit[1], 'Login');
+  await wait(PAUSE.afterPage);
+
+  const after = await screenName();
+  return { flow: 'login', success: after !== before, before, after };
 }
 
-// Shared body of /goonesend and /gooneout — identical except the first (entry) tap.
-async function flowGoOne({ number1, number2, pin, entryXY, label }) {
+// GO ONE (used by both goonesend and gooneout — only the first tap is different).
+// Steps: open number1 -> type number1 -> open number2 -> type number2 ->
+//        confirm -> next -> type PIN -> next -> hold 4s -> final tap.
+async function flowGoOne({ number1, number2, pin, entry, label }) {
   const n1 = String(number1 ?? '');
   const n2 = String(number2 ?? '');
-  const p  = digitsOnly(pin);
-  if (!n1.trim()) throw new Error(label + ': number1 is required');
-  if (!n2.trim()) throw new Error(label + ': number2 is required');
-  if (!p)         throw new Error(label + ': pin is required');
-  const G = FLOWS.goone;
-  log('FLOW ' + label + ' n1=' + n1 + ' n2=' + n2);
-  await tapXY(entryXY, label + ': entry');
-  await sleep(FLOWS.pageWaitMs);
-  // Number1: clipboard set FIRST, THEN tap 287,759 to open, long-press 289,739, paste.
-  await longPressPaste(G.num1XY, n1, 'number1', G.num1OpenXY);
-  // Number2: clipboard set FIRST, THEN tap 963,459 to open, long-press 193,527, paste.
-  await longPressPaste(G.num2XY, n2, 'number2', G.toNum2XY);
-  await tapXY(G.afterNum2XY, label + ': after number2');   // tap 955,481 to select/confirm number2
-  await sleep(400);
-  await tapXY(G.submitNumsXY, label + ': submit numbers');
-  await sleep(FLOWS.pageWaitMs);                            // page changes
-  await tapXY(G.pinFieldXY, label + ': PIN field');
-  await sleep(500);
-  await tapPad(p);                                          // PIN by per-digit XY
-  await sleep(400);
-  await tapXY(G.pinSubmitXY, label + ': PIN submit');
-  await sleep(FLOWS.pageWaitMs);                            // page changes
-  log('  long-press ' + (G.holdMs / 1000) + 's (' + G.holdXY[0] + ',' + G.holdXY[1] + ')');
-  await dev.longpress(G.holdXY[0], G.holdXY[1], G.holdMs);  // 4-second hold
-  await sleep(FLOWS.pageWaitMs);                            // page changes
-  await tapXY(G.finalXY, label + ': final');
+  if (!n1.trim())       throw new Error(label + ': number1 is required');
+  if (!n2.trim())       throw new Error(label + ': number2 is required');
+  if (!digitsOnly(pin)) throw new Error(label + ': pin is required');
+  const C = COORDS.goone;
+  log('FLOW ' + label + ' number1=' + n1 + ' number2=' + n2);
+
+  // 1) open the section
+  await tap(entry[0], entry[1], 'entry');
+  await wait(PAUSE.afterPage);
+
+  // 2) number 1 — open the box, focus it, type it in
+  await tap(C.number1Open[0],  C.number1Open[1],  'open number1');
+  await tap(C.number1Field[0], C.number1Field[1], 'focus number1');
+  await typeInBox(n1);
+  await wait(PAUSE.afterType);
+
+  // 3) number 2 — open the box, focus it, type it in, then confirm
+  await tap(C.number2Open[0],  C.number2Open[1],  'open number2');
+  await tap(C.number2Field[0], C.number2Field[1], 'focus number2');
+  await typeInBox(n2);
+  await wait(PAUSE.afterType);
+  await tap(C.number2Confirm[0], C.number2Confirm[1], 'confirm number2');
+
+  // 4) submit both numbers -> next page
+  await tap(C.numbersNext[0], C.numbersNext[1], 'numbers next');
+  await wait(PAUSE.afterPage);
+
+  // 5) PIN on the next page
+  await tap(C.pinField[0], C.pinField[1], 'PIN box');
+  await typePin(pin);
+  await wait(PAUSE.afterType);
+  await tap(C.pinNext[0], C.pinNext[1], 'PIN next');
+  await wait(PAUSE.afterPage);
+
+  // 6) press and hold, then the final tap
+  await longPress(C.holdSpot[0], C.holdSpot[1], C.holdSeconds, 'hold');
+  await wait(PAUSE.afterPage);
+  await tap(C.finalTap[0], C.finalTap[1], 'final');
+
   return { flow: label, number1: n1, number2: n2 };
 }
-const flowGoOneSend = (body) => flowGoOne({ ...body, entryXY: FLOWS.goone.sendEntryXY, label: 'goonesend' });
-const flowGoOneOut  = (body) => flowGoOne({ ...body, entryXY: FLOWS.goone.outEntryXY,  label: 'gooneout' });
+const flowGoOneSend = (body) => flowGoOne({ ...body, entry: COORDS.goone.entrySend, label: 'goonesend' });
+const flowGoOneOut  = (body) => flowGoOne({ ...body, entry: COORDS.goone.entryOut,  label: 'gooneout' });
 
-// /gooncheck — tap the row, then read the screen and return the text found on that row.
+// CHECK: tap the row, read the screen, return just the number on that row.
 async function flowGoOneCheck() {
-  const C = FLOWS.check;
+  const C = COORDS.check;
   log('FLOW gooncheck');
-  await tapXY(C.rowXY, 'check: row');
-  await sleep(FLOWS.pageWaitMs);
+  await tap(C.row[0], C.row[1], 'check row');
+  await wait(PAUSE.afterPage);
+
   const nodes = await dumpUi().catch(() => []);
-  const y = C.rowXY[1];
-  const rowNodes = nodes.filter((n) => n.text && n.bounds[1] <= y && y <= n.bounds[3]);
-  const rowText = rowNodes.map((n) => n.text).join(' ').trim();
-  // Pull just the number out of the row (drop ৳/currency symbols, thousands commas).
-  const rowJoined = rowNodes.map((n) => n.text).join(' ').replace(/,/g, '');
-  let m = rowJoined.match(/-?\d+(?:\.\d+)?/);
-  if (!m) {
-    const allJoined = nodes.filter((n) => n.text).map((n) => n.text).join(' ').replace(/,/g, '');
-    m = allJoined.match(/-?\d+(?:\.\d+)?/);
-  }
-  const number = m ? m[0] : '';
+  const rowY = C.row[1];
+  const onThisRow = nodes.filter((n) => n.text && n.bounds[1] <= rowY && rowY <= n.bounds[3]);
+  const rowText = onThisRow.map((n) => n.text).join(' ').trim();
+
+  // Keep only the number (drop the ৳ symbol and any thousands commas).
+  const grabNumber = (s) => (String(s).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/) || [''])[0];
+  const allTextJoined = nodes.filter((n) => n.text).map((n) => n.text).join(' ');
+  const number = grabNumber(rowText) || grabNumber(allTextJoined);
+
   return {
     flow: 'gooncheck',
-    number,                                         // the balance/number only, e.g. "62.65"
+    number,                                                 // just the number, e.g. "62.65"
     rowText,
-    row: rowNodes.map((n) => ({ text: n.text, bounds: n.bounds })),
     allText: nodes.filter((n) => n.text).map((n) => n.text),
   };
 }
 
-// Expose the flows as POST /api/<name> actions (serialized + authed like every other action).
+// Make each flow callable as POST /api/<name> (login, goonesend, gooneout, gooncheck).
 Object.assign(actions, {
   login:     flowLogin,
   goonesend: flowGoOneSend,
