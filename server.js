@@ -1075,6 +1075,7 @@ const FLOWS = {
     num1XY:      [218, 697],         // long-press + paste number1
     toNum2XY:    [963, 459],         // tap before number2
     num2XY:      [193, 527],         // long-press + paste number2
+    afterNum2XY: [955, 481],         // tap after pasting number2 (select/confirm it)
     submitNumsXY:[599, 1366],        // submit the two numbers
     pinFieldXY:  [597, 1392],        // (after page change) PIN field
     pinSubmitXY: [562, 1406],        // submit the PIN
@@ -1143,7 +1144,9 @@ async function flowGoOne({ number1, number2, pin, entryXY, label }) {
   await longPressPaste(G.num1XY, n1, 'number1');           // paste number1 as-is
   await tapXY(G.toNum2XY, label + ': to number2');
   await sleep(500);
-  await longPressPaste(G.num2XY, n2, 'number2');           // paste number2 as-is
+  await longPressPaste(G.num2XY, n2, 'number2');           // paste number2 as-is (ends with a 300ms wait)
+  await tapXY(G.afterNum2XY, label + ': after number2');   // tap 955,481 to select/confirm number2
+  await sleep(400);
   await tapXY(G.submitNumsXY, label + ': submit numbers');
   await sleep(FLOWS.pageWaitMs);                            // page changes
   await tapXY(G.pinFieldXY, label + ': PIN field');
