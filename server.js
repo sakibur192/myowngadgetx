@@ -1072,8 +1072,8 @@ const FLOWS = {
   goone: {
     sendEntryXY: [187, 989],        // /goonesend : first tap
     outEntryXY:  [443, 999],        // /gooneout  : first tap
-    num1OpenXY:  [243, 507],         // tap first to open the number1 input
-    num1XY:      [218, 697],         // then long-press here + paste number1
+    num1OpenXY:  [287, 759],         // tap first to open the number1 input
+    num1XY:      [289, 739],         // then long-press here + paste number1
     toNum2XY:    [963, 459],         // tap before number2
     num2XY:      [193, 527],         // long-press + paste number2
     afterNum2XY: [955, 481],         // tap after pasting number2 (select/confirm it)
