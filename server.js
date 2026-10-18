@@ -1090,8 +1090,8 @@ const COORDS = {
     entrySend: [187, 989],  // goonesend: the very first tap
     entryOut:  [443, 999],  // gooneout:  the very first tap
 
-    number1Open:  [287, 759],   // tap to open the "number 1" box
-    number1Field: [289, 739],   // the "number 1" box itself (tap to focus, then type)
+    number1Open:  [317, 718],   // tap to open the "number 1" box
+    number1Field: [249, 492],   // long-press here and paste number 1
 
     number2Open:  [963, 459],   // tap to open the "number 2" box
     number2Field: [193, 527],   // the "number 2" box itself (tap to focus, then type)
@@ -1144,6 +1144,18 @@ async function typePin(pin) { await tapPad(digitsOnly(pin)); }
 // Type text straight into whatever box is focused right now (no clipboard).
 async function typeInBox(value) { await dev.text(String(value ?? '')); }
 
+// Open a box, then long-press it and PASTE the value from the clipboard.
+// The clipboard is set FIRST, so the Clip Setter app briefly comes to the front and
+// returns BEFORE we open the box — that way opening/holding the box is never interrupted.
+async function openLongPressPaste(openXY, fieldXY, value, name) {
+  await dev.setclip(String(value ?? ''));                  // 1) put the text on the clipboard
+  await wait(900);                                         //    Clip Setter sets it and returns
+  await tap(openXY[0], openXY[1], 'open ' + name);         // 2) open the box
+  await longPress(fieldXY[0], fieldXY[1], 1, 'hold ' + name); // 3) long-press the box (~1s)
+  await dev.paste();                                       // 4) paste the clipboard into it
+  await wait(PAUSE.afterType);
+}
+
 // The name of the screen (Activity) in front right now.
 async function screenName() { const s = await currentScreen().catch(() => null); return s ? s.name : '?'; }
 
@@ -1183,11 +1195,8 @@ async function flowGoOne({ number1, number2, pin, entry, label }) {
   await tap(entry[0], entry[1], 'entry');
   await wait(PAUSE.afterPage);
 
-  // 2) number 1 — open the box, focus it, type it in
-  await tap(C.number1Open[0],  C.number1Open[1],  'open number1');
-  await tap(C.number1Field[0], C.number1Field[1], 'focus number1');
-  await typeInBox(n1);
-  await wait(PAUSE.afterType);
+  // 2) number 1 — open the box, then long-press it and paste the number
+  await openLongPressPaste(C.number1Open, C.number1Field, n1, 'number1');
 
   // 3) number 2 — open the box, focus it, type it in, then confirm
   await tap(C.number2Open[0],  C.number2Open[1],  'open number2');
@@ -1272,12 +1281,8 @@ async function flowGoOneCheck() {
 async function flowInput1({ number1 } = {}) {
   const n1 = String(number1 ?? '');
   if (!n1.trim()) throw new Error('input1: number1 is required');
-  const C = COORDS.goone;
   log('FLOW input1 number1=' + n1);
-  await tap(C.number1Open[0],  C.number1Open[1],  'open number1');
-  await tap(C.number1Field[0], C.number1Field[1], 'focus number1');
-  await typeInBox(n1);
-  await wait(PAUSE.afterType);
+  await openLongPressPaste(COORDS.goone.number1Open, COORDS.goone.number1Field, n1, 'number1');
   return { flow: 'input1', number1: n1 };
 }
 
