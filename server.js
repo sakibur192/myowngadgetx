@@ -1072,7 +1072,8 @@ const FLOWS = {
   goone: {
     sendEntryXY: [187, 989],        // /goonesend : first tap
     outEntryXY:  [443, 999],        // /gooneout  : first tap
-    num1XY:      [218, 697],         // long-press + paste number1
+    num1OpenXY:  [243, 507],         // tap first to open the number1 input
+    num1XY:      [218, 697],         // then long-press here + paste number1
     toNum2XY:    [963, 459],         // tap before number2
     num2XY:      [193, 527],         // long-press + paste number2
     afterNum2XY: [955, 481],         // tap after pasting number2 (select/confirm it)
@@ -1141,7 +1142,9 @@ async function flowGoOne({ number1, number2, pin, entryXY, label }) {
   log('FLOW ' + label + ' n1=' + n1 + ' n2=' + n2);
   await tapXY(entryXY, label + ': entry');
   await sleep(FLOWS.pageWaitMs);
-  await longPressPaste(G.num1XY, n1, 'number1');           // paste number1 as-is
+  await tapXY(G.num1OpenXY, label + ': open number1');     // tap 243,507 first
+  await sleep(400);
+  await longPressPaste(G.num1XY, n1, 'number1');           // then long-press + paste number1 as-is
   await tapXY(G.toNum2XY, label + ': to number2');
   await sleep(500);
   await longPressPaste(G.num2XY, n2, 'number2');           // paste number2 as-is (ends with a 300ms wait)
