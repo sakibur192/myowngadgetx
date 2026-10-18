@@ -1214,8 +1214,33 @@ async function flowGoOne({ number1, number2, pin, entry, label }) {
 
   return { flow: label, number1: n1, number2: n2 };
 }
-const flowGoOneSend = (body) => flowGoOne({ ...body, entry: COORDS.goone.entrySend, label: 'goonesend' });
-const flowGoOneOut  = (body) => flowGoOne({ ...body, entry: COORDS.goone.entryOut,  label: 'gooneout' });
+// Check the inputs right away (so a missing field gives an instant error).
+function checkGoOneInputs({ number1, number2, pin } = {}, label) {
+  if (!String(number1 ?? '').trim()) throw new Error(label + ': number1 is required');
+  if (!String(number2 ?? '').trim()) throw new Error(label + ': number2 is required');
+  if (!digitsOnly(pin))              throw new Error(label + ': pin is required');
+}
+
+// Start a long flow on the phone in the BACKGROUND and return straight away.
+// Why: the goone flow takes ~20 seconds (a 4-second hold plus several page waits).
+// If we made the browser wait that whole time, a timeout could cut the request off
+// before the flow finished. Running it in the background lets every step complete.
+// (It still runs one-at-a-time, through the same `exclusive` queue as everything else.)
+function startInBackground(runFlow, label) {
+  exclusive(runFlow)
+    .then(() => log('[background] ' + label + ' finished'))
+    .catch((e) => log('[background] ' + label + ' failed: ' + e.message));
+  return { started: true, flow: label, note: 'running on the phone — watch the phone' };
+}
+
+function flowGoOneSend(body = {}) {
+  checkGoOneInputs(body, 'goonesend');
+  return startInBackground(() => flowGoOne({ ...body, entry: COORDS.goone.entrySend, label: 'goonesend' }), 'goonesend');
+}
+function flowGoOneOut(body = {}) {
+  checkGoOneInputs(body, 'gooneout');
+  return startInBackground(() => flowGoOne({ ...body, entry: COORDS.goone.entryOut, label: 'gooneout' }), 'gooneout');
+}
 
 // CHECK: tap the row, read the screen, return just the number on that row.
 async function flowGoOneCheck() {
@@ -2000,6 +2025,7 @@ function run(action,btnId,body,msgId){
         m.className='msg ok';
         var r=j.result||{};
         if(r.number!==undefined){ m.innerHTML='<span class="big">'+esc(r.number||'(not found)')+'</span>'; }
+        else if(r.started){ m.textContent='\\u2713 Started \\u2014 running on the phone\\u2026 (takes ~20s, watch the phone)'; }
         else if(r.flow==='login'){ m.textContent=(r.success?'\\u2713 Login success':'\\u2717 No screen change (check PIN)')+'  ['+r.before+' \\u2192 '+r.after+']'; }
         else{ m.textContent='\\u2713 '+JSON.stringify(r); }
       } else { m.className='msg err'; m.textContent='\\u2717 '+(j.error||'failed'); }
