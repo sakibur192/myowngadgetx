@@ -22,6 +22,11 @@ const HOST = '0.0.0.0';
 const API_KEY = '76344d7de4bda46b0bea0cf8717088e352e0c1c534474abb'; // openssl rand -hex 24
 const ADB = 'adb';
 const DEVICE = '127.0.0.1:5555';
+// How the server reaches the phone:
+//   'agent' -> the GadgetX Agent app on the phone connects OUT to this server (no adb, no PC, no tunnel)
+//   'adb'   -> classic adb over the reverse tunnel
+const TRANSPORT = 'adb';
+const DEVICE_ID = 'phone-1';   // label for the phone (agent mode); any text
 const DEFAULT_PACKAGE = '';            // your app's package, e.g. 'com.baybex.gadgetx'
 const SCREEN_W = 720;
 const SCREEN_H = 1280;
@@ -169,7 +174,49 @@ function shell(cmd, opts) {
   if (!NOISY.test(cmd)) log('adb >', cmd.length > 140 ? cmd.slice(0, 140) + '…' : cmd);
   return adb(['shell', cmd], opts);
 }
-const screenshot = () => adb(['exec-out', 'screencap -p'], { binary: true });
+const screenshotAdb = () => adb(['exec-out', 'screencap -p'], { binary: true });
+
+// ---------------------------- agent transport (phone connects OUT; no adb/PC/tunnel) ----------------------------
+// The GadgetX Agent app long-polls /api/agent/poll for a command, runs it on the phone via
+// its accessibility service, and posts the result to /api/agent/result.
+const agentQ = [];               // commands waiting for the phone to pick up
+let agentWaiter = null;          // a pending long-poll { res, timer }
+const agentPending = new Map();  // command id -> { resolve, reject, timer }
+let agentLastSeen = 0;
+function agentOnline() { return Date.now() - agentLastSeen < 20000; }
+
+function agentDeliverNext() {
+  if (!agentWaiter || !agentQ.length) return;
+  const w = agentWaiter; agentWaiter = null;
+  clearTimeout(w.timer);
+  w.res.json({ cmd: agentQ.shift() });
+}
+function agentCmd(cmd, timeoutMs = 30000) {
+  cmd.id = crypto.randomBytes(6).toString('hex');
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { agentPending.delete(cmd.id); reject(new Error('agent timeout: ' + cmd.type)); }, timeoutMs);
+    agentPending.set(cmd.id, { resolve, reject, timer });
+    log('[agent] -> ' + cmd.type + ' ' + JSON.stringify(cmd).replace(/,"id":"[^"]+"/, '').slice(0, 120));
+    agentQ.push(cmd);
+    agentDeliverNext();
+  });
+}
+
+// Unified device I/O. Routes to the agent or to adb depending on TRANSPORT.
+const dev = {
+  tap: (x, y) => TRANSPORT === 'agent' ? agentCmd({ type: 'tap', x, y }) : shell(`input tap ${x} ${y}`),
+  swipe: (x1, y1, x2, y2, ms = 300) => TRANSPORT === 'agent' ? agentCmd({ type: 'swipe', x1, y1, x2, y2, ms }) : shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${ms}`),
+  longpress: (x, y, ms = 800) => TRANSPORT === 'agent' ? agentCmd({ type: 'longpress', x, y, ms }) : shell(`input swipe ${x} ${y} ${x} ${y} ${ms}`),
+  text: (s) => TRANSPORT === 'agent' ? agentCmd({ type: 'text', text: String(s ?? '') }) : inputChars(String(s ?? '')),
+  setclip: (s) => TRANSPORT === 'agent' ? agentCmd({ type: 'setclip', text: String(s ?? '') }) : setClipboard(String(s ?? '')),
+  paste: () => TRANSPORT === 'agent' ? agentCmd({ type: 'paste' }) : shell('input keyevent 279'),
+  key: (k) => TRANSPORT === 'agent' ? agentCmd({ type: 'key', key: k }) : shell(`input keyevent ${keyCode(k)}`),
+  async screenshot() {
+    if (TRANSPORT === 'agent') return Buffer.from(await agentCmd({ type: 'screenshot' }, 20000), 'base64');
+    return screenshotAdb();
+  },
+};
+const screenshot = () => dev.screenshot();
 
 // ---------------------------- live touch capture (tap the REAL phone) ----------------------------
 // Reads the phone's touchscreen with `getevent`, so whenever you physically tap the device
@@ -322,7 +369,7 @@ function ensureTouch(force = false) {
 }
 
 // Keep the stream alive while the device is connected.
-setInterval(() => { if (touch.dev && !touch.running) ensureTouch().catch(() => {}); }, 4000);
+setInterval(() => { if (TRANSPORT === 'adb' && touch.dev && !touch.running) ensureTouch().catch(() => {}); }, 4000);
 
 // One automation job at a time, so steps from two requests never interleave
 let jobChain = Promise.resolve();
@@ -601,7 +648,7 @@ async function selectAll() {
 // Tap a fixed [x,y] coordinate, with a log line.
 async function tapXY(xy, labelStr) {
   log('  tap ' + labelStr + ' (' + xy[0] + ',' + xy[1] + ')');
-  await shell(`input tap ${xy[0]} ${xy[1]}`);
+  await dev.tap(xy[0], xy[1]);
 }
 
 // Keep only digits (for PIN / OTP typed on the numeric keypad).
@@ -631,13 +678,13 @@ async function tapPad(str, { submit = false } = {}) {
   for (const ch of digits) {
     const xy = keyXY(ch);
     log('  key ' + ch + ' (' + xy[0] + ',' + xy[1] + ')');
-    await shell(`input tap ${xy[0]} ${xy[1]}`);
+    await dev.tap(xy[0], xy[1]);
     await sleep(KEYPAD.keyDelayMs);
   }
   if (submit) {
     const d = keyXY('DONE');
     log('  key DONE (' + d[0] + ',' + d[1] + ')');
-    await shell(`input tap ${d[0]} ${d[1]}`);
+    await dev.tap(d[0], d[1]);
   }
   return digits;
 }
@@ -736,21 +783,19 @@ const actions = {
   tap: async ({ x, y }) => {
     x = num(x, 'x');
     y = num(y, 'y');
-    await shell(`input tap ${x} ${y}`);
+    await dev.tap(x, y);
     return { x, y };
   },
 
   longpress: async ({ x, y, ms = 800 }) => {
     x = num(x, 'x');
     y = num(y, 'y');
-    await shell(`input swipe ${x} ${y} ${x} ${y} ${num(ms, 'ms')}`);
+    await dev.longpress(x, y, num(ms, 'ms'));
     return { x, y, ms };
   },
 
   swipe: async ({ x1, y1, x2, y2, ms = 300 }) => {
-    await shell(
-      `input swipe ${num(x1, 'x1')} ${num(y1, 'y1')} ${num(x2, 'x2')} ${num(y2, 'y2')} ${num(ms, 'ms')}`
-    );
+    await dev.swipe(num(x1, 'x1'), num(y1, 'y1'), num(x2, 'x2'), num(y2, 'y2'), num(ms, 'ms'));
     return { x1, y1, x2, y2, ms };
   },
 
@@ -772,33 +817,36 @@ const actions = {
     return { direction };
   },
 
-  // Paste text into the focused field (or into "field" if given). Any language.
+  // Type text into the focused field (or into "field" if given). Any language.
   paste: async ({ text, field, clear = false, submit }) => {
     if (field) {
       const el = await findElement(field);
-      await shell(`input tap ${el.x} ${el.y}`);
+      await dev.tap(el.x, el.y);
       await sleep(300);
     }
-    if (clear) await clearField();
-    const via = await insertText(text);
+    if (clear && TRANSPORT !== 'agent') await clearField();
+    await dev.text(text);
     await doSubmit(submit);
-    return { pasted: Array.from(String(text ?? '')).length, via };
+    return { typed: Array.from(String(text ?? '')).length };
   },
 
   // Same as paste, kept for older scripts
   text: async ({ text }) => {
-    const via = await insertText(text);
-    return { typed: Array.from(String(text ?? '')).length, via };
+    await dev.text(text);
+    return { typed: Array.from(String(text ?? '')).length };
   },
 
-  // Paste whatever is in Android's own clipboard
+  // Set the phone clipboard
+  'set-clipboard': async ({ text }) => ({ clipboard: await dev.setclip(text) }),
+
+  // Paste whatever is in the phone clipboard into the focused field
   'paste-clipboard': async () => {
-    await shell('input keyevent 279');
+    await dev.paste();
     return { pasted: 'clipboard' };
   },
 
   key: async ({ key }) => {
-    await shell(`input keyevent ${keyCode(key)}`);
+    await dev.key(key);
     return { key };
   },
 
@@ -876,7 +924,7 @@ const actions = {
     await tapXY(R.mobileXY, 'mobile field');
     await sleep(400);
     log('  type mobile:', mobile);
-    await inputChars(String(mobile ?? ''));
+    await dev.text(String(mobile ?? ''));
     done.push('mobile entered');
     await tapXY(R.nextMobileXY, 'Next (mobile)');
     await sleep(R.pageWaitMs);
@@ -910,7 +958,7 @@ const actions = {
     log('STEP mobile=' + mobile);
     await tapXY(REGISTER.mobileXY, 'mobile field');
     await sleep(400);
-    await inputChars(String(mobile ?? ''));
+    await dev.text(String(mobile ?? ''));
     await tapXY(REGISTER.nextMobileXY, 'Next (mobile)');
     return { step: 'mobile', mobile: String(mobile ?? '') };
   },
@@ -925,72 +973,32 @@ const actions = {
     return { step: 'pin', pin: typed };
   },
 
-  // Step 3: enter the OTP into the boxed field. The method is set by REGISTER.otpMode
-  // (see the config). Default 'keys' sends hardware digit key events, which fill split
-  // OTP boxes even when IME typing and plain paste don't.
+  // Step 3: enter the OTP into the boxed field via the agent (genuine input).
+  //   otpMode 'a11y-paste' -> set clipboard = OTP, then a REAL paste into the focused field
+  //   otpMode 'a11y'/'type'-> set the focused field's text directly (ACTION_SET_TEXT)
+  // Both go through the on-device accessibility service, so the app treats it as real.
   'reg-otp': async ({ code, message, text }) => {
     const otp = String(code ?? message ?? text ?? '').trim();
     if (!otp) throw new Error('No OTP text sent — paste the OTP in the box first');
-    const digits = digitsOnly(otp);
-    const mode = REGISTER.otpMode || 'a11y';
-    const [x, y] = REGISTER.otpXY;
+    const mode = REGISTER.otpMode || 'a11y-paste';
     log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
 
-    if (mode === 'a11y' || mode === 'a11y-paste') {
-      // Accessibility service fills the OTP field as GENUINE input (enable once:
-      // Settings -> Accessibility -> GadgetX OTP Filler). Pastes EXACTLY what we send,
-      // as-is, like a manual paste — the app does whatever it does with it.
-      if (mode === 'a11y-paste') {
-        // 1) put the exact text on the clipboard (via Clip Setter)  2) service does a REAL paste
-        await setClipboard(otp);
-        await sleep(700);
-        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es mode paste -p ${CLIP_APP}`);
-      } else {
-        // service sets the exact text into the focused field (base64 so spaces/newlines survive)
-        const b64 = Buffer.from(otp, 'utf8').toString('base64');
-        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es b64 ${b64} --es mode settext -p ${CLIP_APP}`);
-      }
-      if (REGISTER.otpSubmit && REGISTER.otpNextXY) { await sleep(1200); await tapXY(REGISTER.otpNextXY, 'Submit (otp)'); }
-      return { step: 'otp', otp, mode };
-    }
-
-    if (mode === 'button-paste') {
-      // Put the SMS/OTP on the clipboard via the Clip Setter app, then tap the app's own
-      // Paste button (it reads the clipboard and fills the boxes). Simplest, most reliable.
-      await setClipboard(otp);
-      await sleep(900);                                   // let it set + return to the app
-      if (!REGISTER.otpPasteXY) throw new Error('Set REGISTER.otpPasteXY to the app\'s Paste button coordinate (grab it on /tapsfinder)');
-      await tapXY(REGISTER.otpPasteXY, 'Paste button');
-      if (REGISTER.otpSubmit && REGISTER.otpNextXY) { await sleep(1000); await tapXY(REGISTER.otpNextXY, 'Submit (otp)'); }
-      return { step: 'otp', otp, mode };
-    }
-
-    // focus the first box
-    await tapXY(REGISTER.otpXY, 'OTP box 1');
+    await tapXY(REGISTER.otpXY, 'OTP field');   // focus the first/only box
     await sleep(400);
 
-    if (mode === 'keys') {
-      // Each digit as a hardware key event: KEYCODE_0..9 = 7..16. Split boxes auto-advance.
-      if (!digits) throw new Error('OTP has no digits to key in');
-      for (const d of digits) {
-        await shell('input keyevent ' + (7 + Number(d)));
-        await sleep(180);
-      }
-    } else if (mode === 'type') {
-      await clearField();
-      await inputChars(digits);
+    if (TRANSPORT === 'agent') {
+      // on-device agent accessibility (genuine input)
+      if (mode === 'a11y' || mode === 'type') { await dev.text(otp); }
+      else { await dev.setclip(otp); await sleep(300); await dev.paste(); }
     } else {
-      // 'paste' / 'paste-popup': clipboard via the Clip Setter app, then paste into box 1
-      await setClipboard(otp);
-      await sleep(900);
-      await tapXY(REGISTER.otpXY, 'OTP box 1');
-      await sleep(300);
-      if (mode === 'paste-popup' && REGISTER.otpPasteXY) {
-        await shell(`input swipe ${x} ${y} ${x} ${y} 600`);   // long-press to open the menu
-        await sleep(600);
-        await tapXY(REGISTER.otpPasteXY, 'Paste chip');
+      // adb: drive the Clip Setter accessibility service (genuine paste), as we were testing
+      if (mode === 'a11y' || mode === 'type') {
+        const b64 = Buffer.from(otp, 'utf8').toString('base64');
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es b64 ${b64} --es mode settext -p ${CLIP_APP}`);
       } else {
-        await shell('input keyevent 279');                    // KEYCODE_PASTE
+        await setClipboard(otp);                 // Clip Setter puts the exact text on the clipboard
+        await sleep(700);
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es mode paste -p ${CLIP_APP}`); // REAL paste
       }
     }
 
@@ -1003,8 +1011,6 @@ const actions = {
 
   // Test the keypad: type any digit string on it.
   'keypad': async ({ digits, submit = false }) => ({ typed: await tapPad(digits, { submit }) }),
-
-  'set-clipboard': async ({ text }) => ({ clipboard: await setClipboard(text) }),
 
   'input-chars': async ({ text, field }) => {
     if (field) {
@@ -1045,12 +1051,49 @@ app.get('/flow', (req, res) => res.type('html').send(FLOW_HTML));
 app.get('/tapsfinder', (req, res) => res.type('html').send(FINDER_HTML));
 app.use('/api', auth);
 
+// ---- agent transport endpoints (the phone app talks to these) ----
+// The phone long-polls for the next command.
+app.get('/api/agent/poll', (req, res) => {
+  agentLastSeen = Date.now();
+  if (agentQ.length) return res.json({ cmd: agentQ.shift() });
+  if (agentWaiter) { try { agentWaiter.res.json({}); } catch (_) {} clearTimeout(agentWaiter.timer); }
+  const timer = setTimeout(() => { if (agentWaiter && agentWaiter.res === res) agentWaiter = null; try { res.json({}); } catch (_) {} }, 30000);
+  agentWaiter = { res, timer };
+  req.on('close', () => { if (agentWaiter && agentWaiter.res === res) { clearTimeout(timer); agentWaiter = null; } });
+});
+// The phone posts the result of a command.
+app.post('/api/agent/result', (req, res) => {
+  agentLastSeen = Date.now();
+  const { id, ok, data, error } = req.body || {};
+  const p = agentPending.get(id);
+  if (p) {
+    clearTimeout(p.timer); agentPending.delete(id);
+    if (ok) p.resolve(data); else p.reject(new Error(error || 'agent action failed'));
+  }
+  res.json({ ok: true });
+});
+
 app.get('/api/status', async (req, res) => {
   try {
+    if (TRANSPORT === 'agent') {
+      // health comes from the phone app's poll heartbeat (no adb)
+      let screen = null;
+      if (agentOnline()) { try { await agentCmd({ type: 'ping' }, 4000); } catch (_) {} }
+      return res.json({
+        ok: agentOnline(),
+        transport: 'agent',
+        device: DEVICE_ID,
+        online: agentOnline(),
+        lastSeenMs: agentLastSeen ? Date.now() - agentLastSeen : null,
+        screen,
+        keyboard: 'n/a',
+      });
+    }
     const boot = (await shell('getprop sys.boot_completed')).trim();
     const screen = await currentScreen();
     res.json({
       ok: true,
+      transport: 'adb',
       device: DEVICE,
       booted: boot === '1',
       screen,
@@ -1621,8 +1664,12 @@ poll();
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e && e.message));
 
 app.listen(PORT, HOST, async () => {
-  console.log(`Redroid control server on http://${HOST}:${PORT}`);
+  console.log(`Control server on http://${HOST}:${PORT}  (transport: ${TRANSPORT})`);
   if (API_KEY.startsWith('CHANGE_THIS')) console.warn('!! Set API_KEY in server.js before exposing this server !!');
+  if (TRANSPORT === 'agent') {
+    console.log('Waiting for the GadgetX Agent app on the phone to connect…');
+    return;
+  }
   try {
     await reconnect();
     console.log(`Connected to Android at ${DEVICE}`);
