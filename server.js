@@ -44,7 +44,7 @@ const CLIP_APP = 'com.baybex.clipsetter';
 // the app accepts) and paste it. Fill both to enable. Token from @BotFather; chat id from
 // @userinfobot (your own id) or the group's id.
 const TELEGRAM_BOT_TOKEN = '8786603241:AAEheZP1dMK6OMtKb9KhBhggrVoegIZJOa0';   // e.g. '1234567:AAE...'
-const TELEGRAM_CHAT_ID   = '93372553';   // e.g. '123456789'
+const TELEGRAM_CHAT_ID   = '1942142052';   // e.g. '123456789'
 const CLIP_ACTIVITY = CLIP_APP + '/.ClipActivity';
 
 // The number your app's OTP SMS comes from (used to pick the right SMS)
