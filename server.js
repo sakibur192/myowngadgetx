@@ -1059,6 +1059,134 @@ const actions = {
   },
 };
 
+// ======================= extra flows: login / goone send+out / check =======================
+// All coordinates are device pixels (measured on the real phone). CHANGE here if the UI moves.
+// Each flow is a plain async function so any future caller can invoke it directly; they are
+// also exposed as POST /api/<name> actions (login, goonesend, gooneout, gooncheck) below.
+const FLOWS = {
+  pageWaitMs: 1800,                 // pause after each page change
+  login: {
+    openXY:   [499, 1070],          // tap first (opens / focuses the PIN entry)
+    submitXY: [596, 1401],          // login button
+  },
+  goone: {
+    sendEntryXY: [187, 989],        // /goonesend : first tap
+    outEntryXY:  [443, 999],        // /gooneout  : first tap
+    num1XY:      [218, 697],         // long-press + paste number1
+    toNum2XY:    [963, 459],         // tap before number2
+    num2XY:      [193, 527],         // long-press + paste number2
+    submitNumsXY:[599, 1366],        // submit the two numbers
+    pinFieldXY:  [597, 1392],        // (after page change) PIN field
+    pinSubmitXY: [562, 1406],        // submit the PIN
+    holdXY:      [574, 1628],        // (after page change) long-press 4s here
+    holdMs:      4000,
+    finalXY:     [614, 2242],        // (after page change) final tap
+  },
+  check: {
+    rowXY: [268, 653],               // /gooncheck : tap this row, return its text
+  },
+};
+
+// Long-press a field and paste the given value EXACTLY as-is (clipboard → KEYCODE_PASTE),
+// mirroring the manual "long-press → Paste" action. Nothing is trimmed or altered.
+async function longPressPaste(xy, value, label) {
+  await dev.setclip(String(value ?? ''));
+  await sleep(900);                                        // clipboard set + return to the app
+  log('  long-press+paste ' + label + ' (' + xy[0] + ',' + xy[1] + ')');
+  await dev.longpress(xy[0], xy[1], 700);
+  await sleep(500);
+  await dev.paste();                                       // paste clipboard into the focused field
+  await sleep(300);
+}
+
+// Watch the foreground screen and report whether it changed (used as a success signal).
+async function waitScreenChange(before, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await sleep(500);
+    const now = await currentScreen().catch(() => null);
+    if (now && now.name && now.name !== before.name) return { changed: true, before: before.name, after: now.name };
+  }
+  const now = await currentScreen().catch(() => before);
+  return { changed: now.name !== before.name, before: before.name, after: now.name };
+}
+
+// /login — a PIN is given. Tap to open, enter the PIN on the keypad (per-digit XY), submit.
+// A screen change = login success.
+async function flowLogin({ pin } = {}) {
+  const p = digitsOnly(pin);
+  if (!p) throw new Error('login: no PIN provided');
+  const F = FLOWS.login;
+  log('FLOW login');
+  const before = await currentScreen().catch(() => ({ name: '?' }));
+  await tapXY(F.openXY, 'login: open / PIN field');
+  await sleep(600);
+  await tapPad(p);                                         // PIN by tapping each digit's XY
+  await sleep(400);
+  await tapXY(F.submitXY, 'login: submit');
+  const sc = await waitScreenChange(before, FLOWS.pageWaitMs * 4);
+  return { flow: 'login', success: sc.changed, screenChanged: sc.changed, before: sc.before, after: sc.after };
+}
+
+// Shared body of /goonesend and /gooneout — identical except the first (entry) tap.
+async function flowGoOne({ number1, number2, pin, entryXY, label }) {
+  const n1 = String(number1 ?? '');
+  const n2 = String(number2 ?? '');
+  const p  = digitsOnly(pin);
+  if (!n1.trim()) throw new Error(label + ': number1 is required');
+  if (!n2.trim()) throw new Error(label + ': number2 is required');
+  if (!p)         throw new Error(label + ': pin is required');
+  const G = FLOWS.goone;
+  log('FLOW ' + label + ' n1=' + n1 + ' n2=' + n2);
+  await tapXY(entryXY, label + ': entry');
+  await sleep(FLOWS.pageWaitMs);
+  await longPressPaste(G.num1XY, n1, 'number1');           // paste number1 as-is
+  await tapXY(G.toNum2XY, label + ': to number2');
+  await sleep(500);
+  await longPressPaste(G.num2XY, n2, 'number2');           // paste number2 as-is
+  await tapXY(G.submitNumsXY, label + ': submit numbers');
+  await sleep(FLOWS.pageWaitMs);                            // page changes
+  await tapXY(G.pinFieldXY, label + ': PIN field');
+  await sleep(500);
+  await tapPad(p);                                          // PIN by per-digit XY
+  await sleep(400);
+  await tapXY(G.pinSubmitXY, label + ': PIN submit');
+  await sleep(FLOWS.pageWaitMs);                            // page changes
+  log('  long-press ' + (G.holdMs / 1000) + 's (' + G.holdXY[0] + ',' + G.holdXY[1] + ')');
+  await dev.longpress(G.holdXY[0], G.holdXY[1], G.holdMs);  // 4-second hold
+  await sleep(FLOWS.pageWaitMs);                            // page changes
+  await tapXY(G.finalXY, label + ': final');
+  return { flow: label, number1: n1, number2: n2 };
+}
+const flowGoOneSend = (body) => flowGoOne({ ...body, entryXY: FLOWS.goone.sendEntryXY, label: 'goonesend' });
+const flowGoOneOut  = (body) => flowGoOne({ ...body, entryXY: FLOWS.goone.outEntryXY,  label: 'gooneout' });
+
+// /gooncheck — tap the row, then read the screen and return the text found on that row.
+async function flowGoOneCheck() {
+  const C = FLOWS.check;
+  log('FLOW gooncheck');
+  await tapXY(C.rowXY, 'check: row');
+  await sleep(FLOWS.pageWaitMs);
+  const nodes = await dumpUi().catch(() => []);
+  const y = C.rowXY[1];
+  const rowNodes = nodes.filter((n) => n.text && n.bounds[1] <= y && y <= n.bounds[3]);
+  const rowText = rowNodes.map((n) => n.text).join(' ').trim();
+  return {
+    flow: 'gooncheck',
+    rowText,
+    row: rowNodes.map((n) => ({ text: n.text, bounds: n.bounds })),
+    allText: nodes.filter((n) => n.text).map((n) => n.text),
+  };
+}
+
+// Expose the flows as POST /api/<name> actions (serialized + authed like every other action).
+Object.assign(actions, {
+  login:     flowLogin,
+  goonesend: flowGoOneSend,
+  gooneout:  flowGoOneOut,
+  gooncheck: flowGoOneCheck,
+});
+
 // ---------------------------- HTTP ----------------------------
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -1086,6 +1214,8 @@ function auth(req, res, next) {
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
 app.get('/flow', (req, res) => res.type('html').send(FLOW_HTML));
 app.get('/tapsfinder', (req, res) => res.type('html').send(FINDER_HTML));
+app.get('/mydashboard', (req, res) => res.type('html').send(MYDASH_HTML));
+app.get('/mydashborad', (req, res) => res.type('html').send(MYDASH_HTML)); // alias (alt spelling)
 app.use('/api', auth);
 
 // ---- agent transport endpoints (the phone app talks to these) ----
@@ -1711,6 +1841,89 @@ async function poll(){
 setInterval(()=>{if(!document.hidden)poll();},700);
 poll();
 </script></body></html>`;
+
+// ---------------------------- /mydashboard UI ----------------------------
+const MYDASH_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>My Dashboard</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--err:#e5534b;--field:#0c1116}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
+.wrap{max-width:720px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:20px;margin:0 0 2px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+h2{font-size:15px;margin:0 0 10px}
+label{display:block;font-size:12px;color:var(--muted);margin:0 0 4px}
+input{width:100%;background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:14px ui-monospace,Menlo,Consolas,monospace;margin-bottom:10px}
+button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:12px;font:600 15px system-ui;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.msg{font-size:13px;margin-top:10px;min-height:18px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace}
+.ok{color:var(--ok)}.err{color:var(--err)}
+.big{font-size:18px;font-weight:600;color:var(--ink)}
+.row2{display:flex;gap:10px}.row2>*{flex:1}
+</style></head><body>
+<div class="wrap">
+  <h1>My Dashboard</h1>
+  <p class="sub">GadgetX automation — each button runs a server flow on the phone.</p>
+
+  <div class="card">
+    <h2>Login</h2>
+    <label>PIN</label>
+    <input id="lpin" inputmode="numeric" placeholder="PIN">
+    <button id="blogin" onclick="run('login','blogin',{pin:val('lpin')},'lmsg')">Login</button>
+    <div class="msg" id="lmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Go One — Send</h2>
+    <div class="row2"><div><label>Number 1</label><input id="sn1" placeholder="Number 1"></div><div><label>Number 2</label><input id="sn2" placeholder="Number 2"></div></div>
+    <label>PIN</label>
+    <input id="spin" inputmode="numeric" placeholder="PIN">
+    <button id="bsend" onclick="run('goonesend','bsend',{number1:raw('sn1'),number2:raw('sn2'),pin:val('spin')},'smsg')">Run Send</button>
+    <div class="msg" id="smsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Go One — Out</h2>
+    <div class="row2"><div><label>Number 1</label><input id="on1" placeholder="Number 1"></div><div><label>Number 2</label><input id="on2" placeholder="Number 2"></div></div>
+    <label>PIN</label>
+    <input id="opin" inputmode="numeric" placeholder="PIN">
+    <button id="bout" onclick="run('gooneout','bout',{number1:raw('on1'),number2:raw('on2'),pin:val('opin')},'omsg')">Run Out</button>
+    <div class="msg" id="omsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Check</h2>
+    <button id="bcheck" onclick="run('gooncheck','bcheck',{},'cmsg')">Check Row</button>
+    <div class="msg" id="cmsg"></div>
+  </div>
+</div>
+<script>
+var K='${API_KEY}';
+function val(i){return document.getElementById(i).value.trim()}
+function raw(i){return document.getElementById(i).value}
+function run(action,btnId,body,msgId){
+  var m=document.getElementById(msgId),b=document.getElementById(btnId);
+  b.disabled=true; m.className='msg'; m.textContent='Working…';
+  fetch('/api/'+action,{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify(body)})
+    .then(function(r){return r.json()})
+    .then(function(j){
+      if(j.ok){
+        m.className='msg ok';
+        var r=j.result||{};
+        if(r.rowText!==undefined){ m.innerHTML='<span class="big">'+esc(r.rowText||'(no text found)')+'</span>\\n'+esc(JSON.stringify(r.allText||[])); }
+        else if(r.flow==='login'){ m.textContent=(r.success?'\\u2713 Login success':'\\u2717 No screen change (check PIN)')+'  ['+r.before+' \\u2192 '+r.after+']'; }
+        else{ m.textContent='\\u2713 '+JSON.stringify(r); }
+      } else { m.className='msg err'; m.textContent='\\u2717 '+(j.error||'failed'); }
+    })
+    .catch(function(e){ m.className='msg err'; m.textContent='\\u2717 '+e.message; })
+    .then(function(){ b.disabled=false; });
+}
+function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+</script>
+</body></html>`;
 
 // ---------------------------- start ----------------------------
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e && e.message));
