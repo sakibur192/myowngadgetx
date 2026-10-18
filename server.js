@@ -81,7 +81,7 @@ const REGISTER = {
   //   Settings -> Accessibility -> GadgetX OTP Filler -> On.
   otpMode:      'button-paste', // Clip Setter sets clipboard, then tap the app's Paste button — EXACTLY manual
   otpPasteXY:   [512, 1416],   // the app's Paste BUTTON (measured on the real phone)
-  otpSubmit:    false,         // true = also tap otpNextXY after entering the OTP
+  otpSubmit:    true,          // also tap otpNextXY (Confirm) after pasting the OTP
 };
 
 // On-screen numeric keypad. Exact measured center of each digit key (from /tapsfinder,
@@ -1222,12 +1222,17 @@ app.post('/api/sms', (req, res) => {
   const otp = digitsOnly(sms.message);
 
   if (awaitingOtpUntil && Date.now() < awaitingOtpUntil) {
-    // Armed by the PIN step: type the OTP digits on the keypad, then DONE.
+    // Armed by the PIN step. Paste the EXACT SMS (as received, line break and all) via Clip
+    // Setter, tap the app's own Paste button, then tap Confirm — byte-for-byte the manual flow.
     awaitingOtpUntil = 0;
-    log('  auto-OTP: typing ' + otp + ' on the keypad');
+    log('  auto-OTP: clipboard-paste full SMS -> Paste button -> Confirm');
     exclusive(async () => {
       await sleep(600);
-      await tapPad(otp, { submit: true });
+      await dev.setclip(sms.message);                       // exact SMS text, nothing stripped
+      await sleep(900);                                     // clipboard set + return to the app
+      await tapXY(REGISTER.otpPasteXY, 'app Paste button'); // [512,1416]
+      await sleep(1000);
+      await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');     // [810,1736]
       log('  auto-OTP done');
     }).catch((e) => log('  auto-OTP failed: ' + e.message));
     return res.json({ ok: true, otp, autoOtp: true });
