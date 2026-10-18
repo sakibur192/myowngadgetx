@@ -1094,7 +1094,7 @@ const COORDS = {
     number1Field: [249, 492],   // the "number 1" box itself (tap to focus, then type)
 
     number2Open:  [963, 459],   // tap this to LEAVE page 1 and open the NUMBER 2 page
-    number2Field: [193, 527],   // the "number 2" box on that new page (tap to focus, then type)
+    number2Field: [342, 541],   // the "number 2" box on that new page (long-press to focus, then type)
     number2Confirm: [955, 481], // tap right after typing number 2
 
     numbersNext: [599, 1366],   // button that submits both numbers -> next page
@@ -1221,12 +1221,12 @@ async function flowGoOne({ number1, number2, pin, entry, label }) {
   await openAndType(C.number1Open, C.number1Field, n1, 'number1');
   await wait(1000);   // after number1 is typed, wait 1s for the new page to load fully
 
-  // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — wait for the new page to load
+  // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — wait 2s for it to load fully
   await tap(C.number2Open[0], C.number2Open[1], 'go to number2 page');
-  await wait(PAUSE.afterPage);
+  await wait(2000);
 
-  // 4) NUMBER 2 page — focus its box, type the number in, then confirm
-  await tap(C.number2Field[0], C.number2Field[1], 'focus number2');
+  // 4) NUMBER 2 page — long-press the box to focus, type the number in, then confirm
+  await longPress(C.number2Field[0], C.number2Field[1], 1, 'focus number2');
   await typeInBox(n2);
   await wait(PAUSE.afterType);
   await tap(C.number2Confirm[0], C.number2Confirm[1], 'confirm number2');
