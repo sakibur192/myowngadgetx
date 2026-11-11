@@ -2,7 +2,7 @@
  * Redroid Control Server
  * ----------------------
  * Single-file Node.js server that controls the Android (Redroid) container over ADB:
- * taps, swipes, typing, keys, find-and-tap by text/id, screenshots, app launch/stop,
+ * taps, swipes, typing, keys, find-and-tap by text/id, app launch/stop,
  * and OTP entry from SMS forwarded by a real phone (webhook).
  *
  * Run on the same VPS as Redroid:  pm2 start server.js --name redroid-control
@@ -116,7 +116,6 @@ function shell(cmd, opts) {
   if (!NOISY.test(cmd)) log('adb >', cmd.length > 140 ? cmd.slice(0, 140) + '…' : cmd);
   return adb(['shell', cmd], opts);
 }
-const screenshotAdb = () => adb(['exec-out', 'screencap -p'], { binary: true });
 
 // ---------------------------- agent transport (phone connects OUT; no adb/PC/tunnel) ----------------------------
 // The GadgetX Agent app long-polls /api/agent/poll for a command, runs it on the phone via
@@ -153,12 +152,7 @@ const dev = {
   setclip: (s) => TRANSPORT === 'agent' ? agentCmd({ type: 'setclip', text: String(s ?? '') }) : setClipboard(String(s ?? '')),
   paste: () => TRANSPORT === 'agent' ? agentCmd({ type: 'paste' }) : shell('input keyevent 279'),
   key: (k) => TRANSPORT === 'agent' ? agentCmd({ type: 'key', key: k }) : shell(`input keyevent ${keyCode(k)}`),
-  async screenshot() {
-    if (TRANSPORT === 'agent') return Buffer.from(await agentCmd({ type: 'screenshot' }, 20000), 'base64');
-    return screenshotAdb();
-  },
 };
-const screenshot = () => dev.screenshot();
 
 // Launch an app. In agent mode the phone launches it itself (no adb); in adb mode use monkey.
 async function launchApp(p) {
@@ -1056,7 +1050,6 @@ async function tap(x, y, name) {
   log('  tap ' + (name || '') + ' (' + x + ',' + y + ')');
   await dev.tap(x, y);
   await wait(PAUSE.afterTap);
-  await stepShot('after tap ' + (name || '') + ' (' + x + ',' + y + ')');
 }
 
 // Press and hold at a point for a number of seconds.
@@ -1080,28 +1073,7 @@ async function openAndType(openXY, fieldXY, value, name) {
   await tap(openXY[0], openXY[1], 'open ' + name);
   await tap(fieldXY[0], fieldXY[1], 'focus ' + name);
   await typeInBox(value);
-  await stepShot('typed ' + name + ' = ' + value);
   await wait(PAUSE.afterType);
-}
-
-// ---- DEBUG: save a screenshot after each step so we can SEE what the screen shows ----
-// Turn it on with POST /api/debug {on:true} (or the dashboard button), run a flow, then
-// open  http://<server>:3900/shots  to view every step's screenshot in order.
-let DEBUG_SHOTS = false;
-const SHOTS = [];                 // recent screenshots: { n, name, at, img(dataURL) }
-async function stepShot(name) {
-  if (!DEBUG_SHOTS) return;
-  try {
-    const buf = await dev.screenshot();
-    SHOTS.push({ n: SHOTS.length + 1, name, at: new Date().toLocaleTimeString(), img: 'data:image/png;base64,' + buf.toString('base64') });
-    while (SHOTS.length > 40) SHOTS.shift();
-  } catch (e) { log('shot failed: ' + e.message); }
-}
-async function flowDebug({ on = true } = {}) {
-  DEBUG_SHOTS = !!on;
-  if (on) SHOTS.length = 0;       // start a fresh set
-  log('debug screenshots ' + (on ? 'ON — open /shots after a run' : 'OFF'));
-  return { debugShots: DEBUG_SHOTS, viewAt: '/shots' };
 }
 
 // The name of the screen (Activity) in front right now.
@@ -1134,17 +1106,6 @@ async function tapExpectChange(xy, name, opts = {}) {
     }
   }
   throw new StuckError('stuck at "' + name + '": screen did not change after ' + (retries + 1) + ' taps');
-}
-
-// Keep a few recent "what was on screen when it got stuck" screenshots, served at /shot/:id.
-const outcomeShots = new Map();   // id -> { at, img(Buffer), type }
-let outcomeShotSeq = 0;
-async function saveOutcomeShot() {
-  const buf = await dev.screenshot();
-  const id = 's' + (++outcomeShotSeq);
-  outcomeShots.set(id, { at: Date.now(), img: buf, type: TRANSPORT === 'agent' ? 'image/jpeg' : 'image/png' });
-  while (outcomeShots.size > 120) outcomeShots.delete(outcomeShots.keys().next().value);
-  return id;
 }
 
 // ---- the flows --------------------------------------------------------------
@@ -1444,7 +1405,6 @@ Object.assign(actions, {
   startover:      flowStartOver,
   reset:          flowStartOver,
   'show-touches': flowShowTouches,
-  debug:          flowDebug,
 });
 
 // =============================================================================
@@ -1475,7 +1435,7 @@ async function initDb() {
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
   )`);
   // outcome + Dual-Space icon columns (added if missing, so old databases upgrade cleanly)
-  for (const col of ['last_action TEXT', 'last_status TEXT', 'last_detail TEXT', 'last_shot TEXT',
+  for (const col of ['last_action TEXT', 'last_status TEXT', 'last_detail TEXT',
                      'last_op_at TIMESTAMPTZ', 'open_x INTEGER', 'open_y INTEGER']) {
     await pool.query(`ALTER TABLE instances ADD COLUMN IF NOT EXISTS ${col}`);
   }
@@ -1505,9 +1465,9 @@ const db = {
   setStatus: (id, st) => pool.query(
             `UPDATE instances SET status=$2, updated_at=now() WHERE id=$1`, [id, st]),
   saveOutcome: (id, action, res) => pool.query(
-            `UPDATE instances SET last_action=$2, last_status=$3, last_detail=$4, last_shot=$5,
+            `UPDATE instances SET last_action=$2, last_status=$3, last_detail=$4,
              last_op_at=now(), updated_at=now() WHERE id=$1`,
-            [id, action, res.outcome || '', res.detail || '', res.shot || null]),
+            [id, action, res.outcome || '', res.detail || '']),
   remove: (id)      => pool.query('DELETE FROM instances WHERE id=$1', [id]),
 };
 function needDb() { if (!pool) throw new Error('Postgres not set up: run `npm install pg` and set DATABASE_URL'); }
@@ -1632,8 +1592,6 @@ async function doInstanceAction(inst, action, body = {}) {
     res = (e && e.stuck) ? { outcome: 'stuck', detail: e.message } : { outcome: 'error', detail: e.message };
   }
 
-  // For anything that isn't a clean success, grab a screenshot so you can SEE what happened.
-  if (res.outcome !== 'success') { try { res.shot = await saveOutcomeShot(); } catch (_) {} }
   // Remember the outcome on the instance row.
   await db.saveOutcome(inst.id, action, res).catch(() => {});
   // Leave the phone on a clean state (Home) for the NEXT instance — best effort.
@@ -1647,9 +1605,8 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Log every request coming in and its response going out (skip the screenshot polling).
+// Log every request coming in and its response going out.
 app.use((req, res, next) => {
-  if (req.path === '/api/screenshot') return next();
   const t = Date.now();
   log('→', req.method, req.path);
   res.on('finish', () => log('←', res.statusCode, req.path, Date.now() - t + 'ms'));
@@ -1672,33 +1629,8 @@ app.get('/tapsfinder', (req, res) => res.type('html').send(FINDER_HTML));
 app.get('/mydashboard', (req, res) => res.type('html').send(MYDASH_HTML));
 app.get('/mydashborad', (req, res) => res.type('html').send(MYDASH_HTML)); // alias (alt spelling)
 
-// Debug gallery: every step's screenshot, newest run. Turn capture on with POST /api/debug {on:true}.
-app.get('/shots', (req, res) => {
-  const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  const body = SHOTS.length
-    ? SHOTS.map((s) => `<figure><figcaption>#${s.n} — ${esc(s.name)} <span>${esc(s.at)}</span></figcaption><img src="${s.img}"></figure>`).join('')
-    : '<p style="color:#8a95a0">No screenshots yet. Turn debug ON (dashboard or POST /api/debug {on:true}), run a flow, then refresh.</p>';
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Step screenshots</title><style>
-body{margin:0;background:#0f1419;color:#e6eaee;font:15px system-ui,sans-serif;padding:16px}
-h1{font-size:18px} .g{display:flex;flex-wrap:wrap;gap:16px}
-figure{margin:0;background:#1a212a;border:1px solid #2a333d;border-radius:10px;padding:8px;max-width:300px}
-figcaption{font-size:12px;margin-bottom:6px}figcaption span{color:#8a95a0}
-img{width:100%;height:auto;border-radius:6px;display:block}
-</style></head><body>
-<h1>Step screenshots (${SHOTS.length}) <a href="/shots" style="color:#2f6fed;font-size:13px">refresh</a></h1>
-<div class="g">${body}</div></body></html>`);
-});
-
 app.get('/admin', (req, res) => res.type('html').send(ADMIN_HTML));
 app.get('/i/:id', (req, res) => res.type('html').send(INSTANCE_HTML));   // per-instance control page
-
-// Serve an outcome screenshot (what was on screen when an op finished stuck/failed).
-app.get('/shot/:id', (req, res) => {
-  const s = outcomeShots.get(req.params.id);
-  if (!s) return res.status(404).send('no such shot');
-  res.type(s.type).send(s.img);
-});
 
 app.use('/api', auth);
 
@@ -1839,15 +1771,6 @@ app.get('/api/apps', async (req, res) => {
       .filter((p) => p && p !== 'com.android.adbkeyboard')
       .sort();
     res.json({ ok: true, apps, default: DEFAULT_PACKAGE || null });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/api/screenshot', async (req, res) => {
-  try {
-    const png = await screenshot();
-    res.set('Cache-Control', 'no-store').type('png').send(png);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -2199,7 +2122,6 @@ button:disabled{opacity:.5;cursor:default}
 .msg{font-size:13px;margin-top:8px;min-height:18px;white-space:pre-wrap;word-break:break-word}
 .hint{font-size:13px;color:var(--muted);margin:0 0 10px}
 .ok{color:var(--ok)}.err{color:var(--err)}
-#shot{width:100%;border:1px solid var(--line);border-radius:12px;margin-top:8px;display:none}
 </style></head><body>
 <div class="wrap">
   <h1>GadgetX Flow</h1>
@@ -2500,16 +2422,6 @@ button:disabled{opacity:.5;cursor:default}
     </div>
     <div class="msg" id="tmmsg"></div>
   </div>
-
-  <div class="card">
-    <h2>Debug screenshots</h2>
-    <p class="sub">Turn ON, run a flow, then open <a href="/shots" target="_blank" style="color:var(--accent)">/shots</a> to see a screenshot after every step — so we can tell exactly where a tap lands.</p>
-    <div class="row2">
-      <button id="bdon"  onclick="run('debug','bdon',{on:true},'dmsg')">Debug ON</button>
-      <button id="bdoff" onclick="run('debug','bdoff',{on:false},'dmsg')">Debug OFF</button>
-    </div>
-    <div class="msg" id="dmsg"></div>
-  </div>
 </div>
 <script>
 var K='${API_KEY}';
@@ -2625,7 +2537,7 @@ function load(){
     if(!j.ok){document.getElementById('info').innerHTML='<span class="err">'+esc(j.error)+'</span>';return}
     var i=j.instance;DUAL=!!j.dual;
     document.getElementById('title').textContent=i.label+' (#'+i.id+')';
-    var last=i.last_status?(' · last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status)+'</b> '+esc(i.last_detail||'')+(i.last_shot?(' <a href="/shot/'+esc(i.last_shot)+'" target="_blank">view</a>'):'')):'';
+    var last=i.last_status?(' · last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status)+'</b> '+esc(i.last_detail||'')):'';
     document.getElementById('info').innerHTML='<span class="badge">'+esc(i.status)+'</span> '+esc(i.package)+' · balance <b>'+esc(i.last_balance||'—')+'</b>'+last;
     document.getElementById('emob').value=i.mobile||'';document.getElementById('epin').value=i.pin||'';
     document.getElementById('rmob').value=i.mobile||'';document.getElementById('rpin').value=i.pin||'';
@@ -2648,7 +2560,7 @@ function pollJob(jid,m){
     if(job.status==='running'){m.className='msg';m.textContent='▶ Running…';setTimeout(function(){pollJob(jid,m)},1500);return}
     if(job.status==='done'){var r=job.result||{};var oc=r.outcome||'done';
       m.className='msg '+(oc==='success'?'ok':(oc==='failed'||oc==='error'||oc==='stuck')?'err':'');
-      m.innerHTML=esc(oc.toUpperCase()+(r.detail?(': '+r.detail):'')+(r.balance!==undefined?(' — balance '+r.balance):''))+(r.shot?(' <a href="/shot/'+esc(r.shot)+'" target="_blank">view screen</a>'):'');
+      m.innerHTML=esc(oc.toUpperCase()+(r.detail?(': '+r.detail):'')+(r.balance!==undefined?(' — balance '+r.balance):''));
       load();return}
     m.className='msg err';m.textContent='✗ '+(job.error||'failed');
   });
@@ -2749,7 +2661,7 @@ function card(i){
    +'<div class="hd"><b>'+esc(i.label)+'</b><span class="muted small">#'+id+'</span><span class="badge">'+badge(i)+'</span><a href="/i/'+id+'" style="margin-left:auto;font-size:12px">open page →</a></div>'
    +'<div class="muted small">'+esc(i.package)+'</div>'
    +'<div class="small">mobile: <b>'+esc(i.mobile||'—')+'</b> · pin: <b>'+esc(i.pin||'—')+'</b> · balance: <b>'+esc(i.last_balance||'—')+'</b></div>'
-   +(i.last_status?('<div class="small">last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status.toUpperCase())+'</b> '+esc(i.last_detail||'')+(i.last_shot?(' · <a href="/shot/'+esc(i.last_shot)+'" target="_blank">view screen</a>'):'')+'</div>'):'')
+   +(i.last_status?('<div class="small">last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status.toUpperCase())+'</b> '+esc(i.last_detail||'')+'</div>'):'')
    +'<div class="ops">'
    +'<input placeholder="number1" id="n1_'+id+'"><input placeholder="number2" id="n2_'+id+'">'
    +'<button class="op" data-id="'+id+'" data-act="goonesend">Send</button>'
@@ -2799,7 +2711,7 @@ function pollJob(jobId,m){
       var cls=oc==='success'?'ok':(oc==='failed'||oc==='error'||oc==='stuck')?'err':'';
       var txt=oc.toUpperCase()+(r.detail?(': '+r.detail):'')+(r.balance!==undefined?(' — balance '+r.balance):'');
       m.className='msg '+cls;
-      m.innerHTML=esc(txt)+(r.shot?(' <a href="/shot/'+esc(r.shot)+'" target="_blank">view screen</a>'):'');
+      m.innerHTML=esc(txt);
       load();refreshQueue();return}
     m.className='msg err';m.textContent='✗ '+(job.error||'failed');refreshQueue();
   }).catch(function(e){m.className='msg err';m.textContent='✗ '+e.message});

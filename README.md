@@ -16,7 +16,7 @@ No `.env`, no `yml`, no Docker. All settings are plain files you edit and restar
 | `server.js` | The engine + web pages (`/admin`, `/mydashboard`, `/flow`, `/tapsfinder`). |
 | `package.json` | Deps: `express`, `pg`. |
 
-Find the right coordinates with **`/tapsfinder`** (tap the real button, read the X,Y) or **`/admin` → Debug screenshots** (`/shots`).
+Find the right coordinates with **`/tapsfinder`** (tap the real button, read the X,Y).
 
 ## Install & run
 
@@ -32,7 +32,7 @@ On boot: `[db] instances table ready` means Postgres is connected.
 ## Web pages
 
 - **`/admin`** — the multi‑instance panel. Scan/add clones, and per instance: Send, Out, Check, Login, Register (wipe), Start Over, edit saved mobile/PIN. Shows the live **scheduler** queue.
-- **`/mydashboard`** — single‑phone controls (Start Over, Login, Register, OTP/SMS, Send, Out, Check, tap‑marks, debug screenshots).
+- **`/mydashboard`** — single‑phone controls (Start Over, Login, Register, OTP/SMS, Send, Out, Check, tap‑marks).
 - **`/flow`** — step‑by‑step registration wizard.
 - **`/tapsfinder`** — tap the real phone, read back the exact X,Y.
 
@@ -69,8 +69,7 @@ Tapping coordinates is blind, so every operation is **verified**:
 - **Step verification** — the page‑changing taps (go to number‑2 page, submit numbers, submit PIN) use `tapExpectChange`: tap, then wait for the screen to actually change; re‑tap a few times; if it still won't move → **stuck at "<step>"** (it does not blindly continue).
 - **Result verification** — money ops (send/out) are confirmed by the **balance actually changing**: the server reads the balance before and after and compares (language‑independent ground truth). Check = a number was read. Login/Register = reached Home.
 - **Outcome** of every op is one of: `success` (verified) · `failed` (known bad end, e.g. balance unchanged / wrong PIN) · `stuck` (taps done, screen wouldn't progress) · `error` (device/other).
-- On anything not a clean success, it saves a **screenshot** (`/shot/:id`, shown in `/admin` as "view screen") so you can see exactly where it stopped.
-- The outcome is stored on the instance (`last_status`, `last_detail`, `last_shot`) and returned in the job.
+- The outcome is stored on the instance (`last_status`, `last_detail`) and returned in the job.
 - **Recovery** — after each op the server returns the phone to **Home** so the next instance starts clean.
 
 Tune in `config.js → VERIFY` (`verifyByBalance`, `stepChangeMs`, `stepRetries`, `settleMs`).
