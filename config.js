@@ -52,7 +52,7 @@ module.exports = {
 
   // ===== OTP / SMS =====
   OTP_REGEX: /\b(\d{4,8})\b/,              // how the OTP is pulled from an SMS
-  OTP_SENDER: '01750006696',               // the number the OTP comes from
+  OTP_SENDER: '01712345678',               // the number the OTP comes from
   TELEGRAM_BOT_TOKEN: '8786603241:AAEheZP1dMK6OMtKb9KhBhggrVoegIZJOa0',
   TELEGRAM_CHAT_ID: '1942142052',
 

@@ -1688,6 +1688,7 @@ img{width:100%;height:auto;border-radius:6px;display:block}
 });
 
 app.get('/admin', (req, res) => res.type('html').send(ADMIN_HTML));
+app.get('/i/:id', (req, res) => res.type('html').send(INSTANCE_HTML));   // per-instance control page
 
 // Serve an outcome screenshot (what was on screen when an op finished stuck/failed).
 app.get('/shot/:id', (req, res) => {
@@ -1701,6 +1702,10 @@ app.use('/api', auth);
 // ---- instances (cloned apps): list / add / edit / delete / scan / run-one-op ----
 app.get('/api/instances', async (req, res) => {
   try { needDb(); res.json({ ok: true, instances: await db.list() }); }
+  catch (e) { res.json({ ok: false, error: e.message }); }
+});
+app.get('/api/instances/:id', async (req, res) => {
+  try { needDb(); const inst = await db.get(req.params.id); if (!inst) return res.status(404).json({ ok: false, error: 'instance not found' }); res.json({ ok: true, instance: inst, dual: !!DUAL.enabled }); }
   catch (e) { res.json({ ok: false, error: e.message }); }
 });
 app.get('/api/mode', (req, res) => res.json({ ok: true, dual: !!DUAL.enabled, dualPkg: DUAL.pkg, appPkg: DEFAULT_PACKAGE }));
@@ -2529,6 +2534,139 @@ function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;'
 </script>
 </body></html>`;
 
+// ---------------------------- /i/:id — single-instance control page ----------------------------
+const INSTANCE_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instance</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--err:#e5534b;--warn:#e0a53c;--field:#0c1116}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
+.wrap{max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+h1{font-size:19px;margin:0}
+.muted{color:var(--muted)} .small{font-size:12.5px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+h2{font-size:15px;margin:0 0 10px}
+label{display:block;font-size:12px;color:var(--muted);margin:6px 0 4px}
+input,textarea{width:100%;background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:14px ui-monospace,Menlo,Consolas,monospace;margin-bottom:8px}
+button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:11px;font:600 14px system-ui;cursor:pointer}
+button.ghost{background:var(--panel);border:1px solid var(--line);color:var(--ink)}
+.row2{display:flex;gap:8px}.row2>*{flex:1}
+.msg{font-size:12.5px;margin-top:8px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace}
+.ok{color:var(--ok)}.err{color:var(--err)}
+.badge{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.o-success{color:var(--ok)}.o-failed,.o-error{color:var(--err)}.o-stuck{color:var(--warn)}
+a{color:var(--accent)}
+</style></head><body>
+<div class="wrap">
+  <div><a href="/admin" class="small">← all instances</a></div>
+  <h1 id="title">Instance</h1>
+  <div id="info" class="small muted"></div>
+
+  <div class="card">
+    <h2>Register (sets up this clone)</h2>
+    <div class="row2"><div><label>Mobile</label><input id="rmob" inputmode="numeric" placeholder="Mobile number"></div><div><label>PIN</label><input id="rpin" inputmode="numeric" placeholder="PIN"></div></div>
+    <button onclick="op('register',{mobile:raw('rmob'),pin:raw('rpin')})">Register</button>
+    <div class="msg" id="m_register"></div>
+  </div>
+
+  <div class="card">
+    <h2>OTP / SMS</h2>
+    <p class="small muted" style="margin:0 0 6px">When Register is waiting for the OTP, paste the SMS (or code) and send it.</p>
+    <textarea id="otpsms" rows="2" placeholder="Paste the OTP SMS or code"></textarea>
+    <button onclick="sendSms()">Send OTP/SMS to phone</button>
+    <div class="msg" id="m_sms"></div>
+  </div>
+
+  <div class="card">
+    <h2>Send</h2>
+    <div class="row2"><input id="sn1" placeholder="Number 1"><input id="sn2" placeholder="Number 2"></div>
+    <button onclick="op('goonesend',{number1:raw('sn1'),number2:raw('sn2')})">Run Send</button>
+    <div class="msg" id="m_goonesend"></div>
+  </div>
+
+  <div class="card">
+    <h2>Out</h2>
+    <div class="row2"><input id="on1" placeholder="Number 1"><input id="on2" placeholder="Number 2"></div>
+    <button onclick="op('gooneout',{number1:raw('on1'),number2:raw('on2')})">Run Out</button>
+    <div class="msg" id="m_gooneout"></div>
+  </div>
+
+  <div class="card">
+    <h2>Check / Login / Reset</h2>
+    <div class="row2">
+      <button onclick="op('gooncheck',{})">Check balance</button>
+      <button class="ghost" onclick="op('login',{})">Login</button>
+    </div>
+    <button class="ghost" style="margin-top:8px" onclick="op('startover',{})">Start Over (clear data)</button>
+    <div class="msg" id="m_check"></div>
+  </div>
+
+  <div class="card">
+    <h2>Saved details</h2>
+    <div class="row2"><div><label>Mobile</label><input id="emob"></div><div><label>PIN</label><input id="epin"></div></div>
+    <div class="row2" id="iconrow" style="display:none"><div><label>Dual Space icon X</label><input id="eix"></div><div><label>icon Y</label><input id="eiy"></div></div>
+    <button class="ghost" onclick="saveDetails()">Save</button>
+    <div class="msg" id="m_save"></div>
+  </div>
+</div>
+<script>
+var K='${API_KEY}';
+var ID=location.pathname.split('/').filter(Boolean).pop();
+var DUAL=false;
+function hJSON(method,url,body){return fetch(url,{method:method,headers:{'content-type':'application/json','x-api-key':K},body:body?JSON.stringify(body):undefined}).then(function(r){return r.json()})}
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+function raw(id){var el=document.getElementById(id);return el?el.value:''}
+function load(){
+  hJSON('GET','/api/instances/'+ID).then(function(j){
+    if(!j.ok){document.getElementById('info').innerHTML='<span class="err">'+esc(j.error)+'</span>';return}
+    var i=j.instance;DUAL=!!j.dual;
+    document.getElementById('title').textContent=i.label+' (#'+i.id+')';
+    var last=i.last_status?(' · last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status)+'</b> '+esc(i.last_detail||'')+(i.last_shot?(' <a href="/shot/'+esc(i.last_shot)+'" target="_blank">view</a>'):'')):'';
+    document.getElementById('info').innerHTML='<span class="badge">'+esc(i.status)+'</span> '+esc(i.package)+' · balance <b>'+esc(i.last_balance||'—')+'</b>'+last;
+    document.getElementById('emob').value=i.mobile||'';document.getElementById('epin').value=i.pin||'';
+    document.getElementById('rmob').value=i.mobile||'';document.getElementById('rpin').value=i.pin||'';
+    if(DUAL){document.getElementById('iconrow').style.display='flex';document.getElementById('eix').value=(i.open_x!=null?i.open_x:'');document.getElementById('eiy').value=(i.open_y!=null?i.open_y:'');}
+  });
+}
+function op(action,body){
+  var m=document.getElementById('m_'+(action==='goonesend'?'goonesend':action==='gooneout'?'gooneout':action==='register'?'register':'check'));
+  if(!m)m=document.getElementById('m_check');
+  m.className='msg';m.textContent='Queued…';
+  hJSON('POST','/api/i/'+ID+'/'+action,body).then(function(j){
+    if(!j.ok){m.className='msg err';m.textContent='✗ '+(j.error||'failed');return}
+    pollJob(j.job.id,m);
+  }).catch(function(e){m.className='msg err';m.textContent='✗ '+e.message});
+}
+function pollJob(jid,m){
+  hJSON('GET','/api/jobs/'+jid).then(function(j){
+    var job=j.job;if(!job){m.textContent='job gone';return}
+    if(job.status==='queued'){m.className='msg';m.textContent='⏳ Queued…';setTimeout(function(){pollJob(jid,m)},1500);return}
+    if(job.status==='running'){m.className='msg';m.textContent='▶ Running…';setTimeout(function(){pollJob(jid,m)},1500);return}
+    if(job.status==='done'){var r=job.result||{};var oc=r.outcome||'done';
+      m.className='msg '+(oc==='success'?'ok':(oc==='failed'||oc==='error'||oc==='stuck')?'err':'');
+      m.innerHTML=esc(oc.toUpperCase()+(r.detail?(': '+r.detail):'')+(r.balance!==undefined?(' — balance '+r.balance):''))+(r.shot?(' <a href="/shot/'+esc(r.shot)+'" target="_blank">view screen</a>'):'');
+      load();return}
+    m.className='msg err';m.textContent='✗ '+(job.error||'failed');
+  });
+}
+function sendSms(){
+  var m=document.getElementById('m_sms');m.className='msg';m.textContent='Sending…';
+  hJSON('POST','/api/sms',{message:raw('otpsms')}).then(function(j){
+    m.className=j.ok?'msg ok':'msg err';m.textContent=j.ok?('✓ sent'+(j.otp?(' — code '+j.otp):'')):('✗ '+(j.error||'failed'));
+  }).catch(function(e){m.className='msg err';m.textContent='✗ '+e.message});
+}
+function saveDetails(){
+  var body={mobile:raw('emob'),pin:raw('epin')};
+  if(DUAL){body.open_x=raw('eix');body.open_y=raw('eiy');}
+  hJSON('PATCH','/api/instances/'+ID,body).then(function(j){
+    var m=document.getElementById('m_save');m.className=j.ok?'msg ok':'msg err';m.textContent=j.ok?'✓ saved':'✗ '+j.error;if(j.ok)load();
+  });
+}
+load();
+</script>
+</body></html>`;
+
 // ---------------------------- /admin UI (multi-instance) ----------------------------
 const ADMIN_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2605,7 +2743,7 @@ function badge(i){return esc(i.status)}
 function card(i){
   var id=i.id;
   return '<div class="card">'
-   +'<div class="hd"><b>'+esc(i.label)+'</b><span class="muted small">#'+id+'</span><span class="badge">'+badge(i)+'</span></div>'
+   +'<div class="hd"><b>'+esc(i.label)+'</b><span class="muted small">#'+id+'</span><span class="badge">'+badge(i)+'</span><a href="/i/'+id+'" style="margin-left:auto;font-size:12px">open page →</a></div>'
    +'<div class="muted small">'+esc(i.package)+'</div>'
    +'<div class="small">mobile: <b>'+esc(i.mobile||'—')+'</b> · pin: <b>'+esc(i.pin||'—')+'</b> · balance: <b>'+esc(i.last_balance||'—')+'</b></div>'
    +(i.last_status?('<div class="small">last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status.toUpperCase())+'</b> '+esc(i.last_detail||'')+(i.last_shot?(' · <a href="/shot/'+esc(i.last_shot)+'" target="_blank">view screen</a>'):'')+'</div>'):'')
