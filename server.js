@@ -948,6 +948,7 @@ const actions = {
   // Step 1: tap mobile field, type number, tap Next.
   'reg-mobile': async ({ mobile }) => {
     log('STEP mobile=' + mobile);
+    if (REGISTER.preMobileXY) { await tapXY(REGISTER.preMobileXY, 'registration first tap'); await sleep(600); }
     await tapXY(REGISTER.mobileXY, 'mobile field');
     await sleep(400);
     await dev.text(String(mobile ?? ''));
@@ -1328,6 +1329,8 @@ async function registerSteps({ mobile, pin }) {
   if (!digitsOnly(pin))             throw new Error('register needs a PIN');
   const R = REGISTER;
   log('  [register] mobile=' + mobile);
+  // VERY FIRST tap on the registration screen (before the number)
+  if (R.preMobileXY) { await tapXY(R.preMobileXY, 'registration first tap'); await sleep(600); }
   // mobile
   await tapXY(R.mobileXY, 'mobile field'); await sleep(400);
   await dev.text(String(mobile));

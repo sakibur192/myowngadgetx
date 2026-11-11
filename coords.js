@@ -11,6 +11,7 @@ const { PACKAGE } = require('./config');   // the app package lives in config.js
 
 // ---- Registration screen (mobile -> PIN -> OTP) ----
 const REGISTER = {
+  preMobileXY:  [831, 1857],   // the VERY FIRST tap on registration, before entering the number
   mobileXY:     [582, 721],    // mobile field
   nextMobileXY: [540, 1102],   // Next (after mobile)
   pinXY:        [540, 934],    // PIN field
