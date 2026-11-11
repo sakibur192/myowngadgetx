@@ -14,48 +14,32 @@ const https = require('https');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
-// ============================ CONFIG ============================
-const PORT = 3900;
-const HOST = '0.0.0.0';
-const API_KEY = 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET'; // openssl rand -hex 24
-const ADB = 'adb';
-const DEVICE = '127.0.0.1:5555';
-const DEFAULT_PACKAGE = '';            // your app's package, e.g. 'com.baybex.gadgetx'
-const SCREEN_W = 720;
-const SCREEN_H = 1280;
-const OTP_REGEX = /\b(\d{4,8})\b/;     // how the OTP is pulled out of an SMS
+// ===================== CONFIG — see config.js, coords.js, queue.js =====================
+const CFG = require("./config");
+const {
+  PORT, HOST, API_KEY, ADB, DEVICE, TRANSPORT, DEVICE_ID, SCREEN_W, SCREEN_H,
+  OTP_REGEX, OTP_SENDER, DATABASE_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+  USE_ADB_KEYBOARD, ADB_KEYBOARD_URL, CLIP_APP, AUTO_TYPE_SMS_OTP, OTP_FIELD, OTP_AUTO_SUBMIT, VERIFY,
+} = CFG;
+const DUAL = CFG.DUAL_SPACE || { enabled: false };
+const DEFAULT_PACKAGE = CFG.PACKAGE;            // base app package (cloner changes it) — edit in config.js
+const CLIP_ACTIVITY = CLIP_APP + "/.ClipActivity";
 
-// Paste through ADB Keyboard (supports Bangla, emoji, any text). Installed into Android automatically.
-const USE_ADB_KEYBOARD = true;
-const ADB_KEYBOARD_URL = 'https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk';
+// Tap points (edit anytime in coords.js):
+const { REGISTER, KEYPAD, PIN, COORDS, PAUSE, APP } = require("./coords");
 
-// The number your app's OTP SMS comes from (used to pick the right SMS)
-const OTP_SENDER = '01750006696';
-
-// Your app's registration screen. Adjust the selectors to match your app.
-// Find the real id / text of each field with:  GET /api/ui
-// A selector can be { id: 'etName' } or { text: 'Full name' } or { contains: true, text: 'name' }.
-// IMPORTANT: run  GET /api/ui  on each screen and replace these with your app's real
-// resource-ids, e.g. { id: 'etName' }. Ids are exact and never collide; text guesses can.
-const REGISTER = {
-  restartFirst:  true,                 // relaunch the app fresh before registering
-  nameField:     { contains: true, text: 'name' },
-  mobileField:   { contains: true, text: 'mobile' },
-  sendOtpButton: { contains: true, text: 'send otp' },  // the "Send OTP" / "Continue" button
-  otpField:      { contains: true, text: 'enter otp' }, // the OTP input on the next step
-  verifyButton:  { contains: true, text: 'verify' },    // the "Verify" / "Submit" button
-  successText:   null,                 // optional text that proves the next page opened, e.g. 'Home'
-};
-
-// Auto-type every incoming SMS OTP (when no "wait-otp" step is waiting for it)
-const AUTO_TYPE_SMS_OTP = false;
-const OTP_FIELD = null;                // e.g. { id: 'otpInput' } or { text: 'Enter OTP' }; null = currently focused field
-const OTP_AUTO_SUBMIT = null;          // e.g. 'ENTER' or { text: 'Verify' }; null = don't submit
-// ================================================================
+// Request scheduler (runs one-at-a-time, serves all):
+const queue = require("./queue");
+// ======================================================================================
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Timestamped logging so the pm2 log shows everything that happens.
+function log(...a) {
+  try { console.log(new Date().toISOString().slice(11, 23), ...a); } catch (e) {}
+}
 
 // ---------------------------- ADB core ----------------------------
 function execAdb(args, { binary = false, timeout = 30000 } = {}) {
@@ -109,8 +93,241 @@ async function adb(args, opts) {
     return execAdb(['-s', DEVICE, ...args], opts);
   }
 }
-const shell = (cmd, opts) => adb(['shell', cmd], opts);
-const screenshot = () => adb(['exec-out', 'screencap -p'], { binary: true });
+// Keep-alive: ping the device on a timer so an idle adb-over-TCP link can't quietly drop.
+// adb() self-reconnects on a connection error, so this both keeps it warm AND auto-heals.
+// Only runs in adb mode (agent mode holds its own long-poll connection).
+let heartbeatTimer = null;
+let heartbeatBusy = false;
+function startHeartbeat(everyMs = 20000) {
+  if (TRANSPORT !== 'adb' || heartbeatTimer) return;
+  heartbeatTimer = setInterval(async () => {
+    if (heartbeatBusy) return;                 // don't stack if the phone is slow
+    heartbeatBusy = true;
+    try { await adb(['shell', 'true']); }      // cheap liveness check; reconnects on CONN_ERR
+    catch (e) { log('[heartbeat] ' + (e.message || 'device check failed')); }
+    finally { heartbeatBusy = false; }
+  }, everyMs);
+  console.log('[heartbeat] keep-alive every ' + (everyMs / 1000) + 's');
+}
+
+// Log every device command except the noisy polling ones (screenshot, ui dump, status).
+const NOISY = /screencap|uiautomator|dumpsys window|getprop sys\.boot|settings get secure|pm list packages|shell true/;
+function shell(cmd, opts) {
+  if (!NOISY.test(cmd)) log('adb >', cmd.length > 140 ? cmd.slice(0, 140) + '…' : cmd);
+  return adb(['shell', cmd], opts);
+}
+const screenshotAdb = () => adb(['exec-out', 'screencap -p'], { binary: true });
+
+// ---------------------------- agent transport (phone connects OUT; no adb/PC/tunnel) ----------------------------
+// The GadgetX Agent app long-polls /api/agent/poll for a command, runs it on the phone via
+// its accessibility service, and posts the result to /api/agent/result.
+const agentQ = [];               // commands waiting for the phone to pick up
+let agentWaiter = null;          // a pending long-poll { res, timer }
+const agentPending = new Map();  // command id -> { resolve, reject, timer }
+let agentLastSeen = 0;
+function agentOnline() { return Date.now() - agentLastSeen < 20000; }
+
+function agentDeliverNext() {
+  if (!agentWaiter || !agentQ.length) return;
+  const w = agentWaiter; agentWaiter = null;
+  clearTimeout(w.timer);
+  w.res.json({ cmd: agentQ.shift() });
+}
+function agentCmd(cmd, timeoutMs = 30000) {
+  cmd.id = crypto.randomBytes(6).toString('hex');
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { agentPending.delete(cmd.id); reject(new Error('agent timeout: ' + cmd.type)); }, timeoutMs);
+    agentPending.set(cmd.id, { resolve, reject, timer });
+    log('[agent] -> ' + cmd.type + ' ' + JSON.stringify(cmd).replace(/,"id":"[^"]+"/, '').slice(0, 120));
+    agentQ.push(cmd);
+    agentDeliverNext();
+  });
+}
+
+// Unified device I/O. Routes to the agent or to adb depending on TRANSPORT.
+const dev = {
+  tap: (x, y) => TRANSPORT === 'agent' ? agentCmd({ type: 'tap', x, y }) : shell(`input tap ${x} ${y}`),
+  swipe: (x1, y1, x2, y2, ms = 300) => TRANSPORT === 'agent' ? agentCmd({ type: 'swipe', x1, y1, x2, y2, ms }) : shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${ms}`),
+  longpress: (x, y, ms = 800) => TRANSPORT === 'agent' ? agentCmd({ type: 'longpress', x, y, ms }) : shell(`input swipe ${x} ${y} ${x} ${y} ${ms}`),
+  text: (s) => TRANSPORT === 'agent' ? agentCmd({ type: 'text', text: String(s ?? '') }) : inputChars(String(s ?? '')),
+  setclip: (s) => TRANSPORT === 'agent' ? agentCmd({ type: 'setclip', text: String(s ?? '') }) : setClipboard(String(s ?? '')),
+  paste: () => TRANSPORT === 'agent' ? agentCmd({ type: 'paste' }) : shell('input keyevent 279'),
+  key: (k) => TRANSPORT === 'agent' ? agentCmd({ type: 'key', key: k }) : shell(`input keyevent ${keyCode(k)}`),
+  async screenshot() {
+    if (TRANSPORT === 'agent') return Buffer.from(await agentCmd({ type: 'screenshot' }, 20000), 'base64');
+    return screenshotAdb();
+  },
+};
+const screenshot = () => dev.screenshot();
+
+// Launch an app. In agent mode the phone launches it itself (no adb); in adb mode use monkey.
+async function launchApp(p) {
+  p = pkgName(p);
+  if (TRANSPORT === 'agent') { await agentCmd({ type: 'launch', pkg: p }, 15000); return p; }
+  await shell(`monkey -p ${p} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1`);
+  return p;
+}
+
+// Run a PRIVILEGED shell command (pm clear/grant, settings put, am force-stop).
+// adb mode: the adb shell already has permission. agent mode: needs ROOT on the phone (su);
+// if the phone isn't rooted these return an "SU_ERROR …" string and the caller carries on.
+async function suShell(cmd) {
+  if (TRANSPORT === 'agent') { const out = await agentCmd({ type: 'shell', cmd }, 20000); return String(out ?? ''); }
+  return shell(cmd);
+}
+
+// ---------------------------- live touch capture (tap the REAL phone) ----------------------------
+// Reads the phone's touchscreen with `getevent`, so whenever you physically tap the device
+// the (x,y) in screen pixels is captured and served to /tapsfinder. No screenshot needed.
+const touch = {
+  dev: '',            // /dev/input/eventX of the touchscreen
+  maxX: 0, maxY: 0,   // raw digitizer range
+  dispW: 0, dispH: 0, // display size in px (what `input tap` uses)
+  taps: [],           // { id, x, y, rawX, rawY, t }
+  seq: 0,
+  proc: null,
+  running: false,
+  error: '',
+  startedAt: 0,
+};
+
+function parseWmSize(out) {
+  // Prefer "Override size:" then "Physical size:"
+  const over = /Override size:\s*(\d+)x(\d+)/.exec(out);
+  const phys = /Physical size:\s*(\d+)x(\d+)/.exec(out);
+  const m = over || phys;
+  return m ? { w: +m[1], h: +m[2] } : null;
+}
+
+// Find the touchscreen input device and its raw coordinate range.
+async function detectTouch() {
+  const lp = await adb(['shell', 'getevent', '-lp']);
+  const blocks = lp.split(/add device \d+:\s*/).slice(1);
+  let best = null;
+  for (const b of blocks) {
+    const path = (b.match(/^(\/dev\/input\/event\d+)/) || [])[1];
+    if (!path) continue;
+    const mtx = /ABS_MT_POSITION_X[^\n]*max\s+(\d+)/.exec(b);
+    const mty = /ABS_MT_POSITION_Y[^\n]*max\s+(\d+)/.exec(b);
+    const ax = /ABS_X[^\n]*max\s+(\d+)/.exec(b);
+    const ay = /ABS_Y[^\n]*max\s+(\d+)/.exec(b);
+    if (mtx && mty) { best = { path, maxX: +mtx[1], maxY: +mty[1], mt: true }; break; }
+    if (!best && ax && ay) best = { path, maxX: +ax[1], maxY: +ay[1], mt: false };
+  }
+  if (!best) throw new Error('No touchscreen input device found in `getevent -lp`');
+
+  let disp = null;
+  try { disp = parseWmSize(await shell('wm size')); } catch (_) {}
+  touch.dev = best.path;
+  touch.maxX = best.maxX;
+  touch.maxY = best.maxY;
+  touch.dispW = disp ? disp.w : (best.maxX + 1);
+  touch.dispH = disp ? disp.h : (best.maxY + 1);
+  log(`[touch] device=${touch.dev} raw=${touch.maxX}x${touch.maxY} display=${touch.dispW}x${touch.dispH}`);
+}
+
+function scaleTap(rawX, rawY) {
+  const x = Math.round(rawX * touch.dispW / (touch.maxX || touch.dispW));
+  const y = Math.round(rawY * touch.dispH / (touch.maxY || touch.dispH));
+  return {
+    x: Math.max(0, Math.min(touch.dispW, x)),
+    y: Math.max(0, Math.min(touch.dispH, y)),
+  };
+}
+
+function pushTap(rawX, rawY) {
+  const s = scaleTap(rawX, rawY);
+  const t = { id: ++touch.seq, x: s.x, y: s.y, rawX, rawY, t: Date.now() };
+  touch.taps.push(t);
+  if (touch.taps.length > 500) touch.taps.splice(0, touch.taps.length - 500);
+  log(`[touch] tap @ ${s.x},${s.y}  (raw ${rawX},${rawY})`);
+}
+
+// Stream getevent and emit one tap per finger-up, at the last known position.
+function startTouchStream() {
+  if (touch.proc) return;
+  const args = ['-s', DEVICE, 'shell', 'getevent', '-l', touch.dev];
+  const p = spawn(ADB, args);
+  touch.proc = p;
+  touch.running = true;
+  touch.startedAt = Date.now();
+
+  let buf = '';
+  let lastX = null, lastY = null;   // most recent coords during the current touch
+  let downX = null, downY = null;   // coords captured at finger-down
+  let touching = false;
+
+  const liftFinger = () => {
+    if (lastX != null && lastY != null) pushTap(lastX, lastY);
+    touching = false; lastX = lastY = null;
+  };
+  const onLine = (line) => {
+    // getevent -l lines, e.g.:
+    //   "EV_ABS       ABS_MT_POSITION_X    000003c5"   (value is hex)
+    //   "EV_KEY       BTN_TOUCH            DOWN"        (value is symbolic)
+    const m = /EV_\w+\s+(\w+)\s+(\S+)/.exec(line);
+    if (!m) return;
+    const code = m[1];
+    const raw = m[2];
+    const isHex = /^[0-9a-fA-F]+$/.test(raw);
+    const num = isHex ? parseInt(raw, 16) : NaN;
+    switch (code) {
+      case 'ABS_MT_POSITION_X':
+      case 'ABS_X':
+        lastX = num; touching = true; break;
+      case 'ABS_MT_POSITION_Y':
+      case 'ABS_Y':
+        lastY = num; break;
+      case 'ABS_MT_TRACKING_ID':
+        if (num === 0xffffffff) liftFinger();   // finger up (type B multitouch)
+        else touching = true;
+        break;
+      case 'BTN_TOUCH':
+        if (raw === 'UP' || num === 0) liftFinger();       // finger up (symbolic or hex)
+        else { touching = true; downX = lastX; downY = lastY; }
+        break;
+    }
+  };
+
+  p.stdout.on('data', (d) => {
+    buf += d.toString();
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      try { onLine(line); } catch (_) {}
+    }
+  });
+  p.stderr.on('data', (d) => { const s = d.toString().trim(); if (s) touch.error = s; });
+  const done = (why) => {
+    if (touch.proc === p) { touch.proc = null; touch.running = false; }
+    log('[touch] getevent stream ended: ' + why);
+  };
+  p.on('error', (e) => { touch.error = e.message; done(e.message); });
+  p.on('close', (c) => done('exit ' + c));
+}
+
+let touchInit = null;
+// Make sure detection + streaming are up. Safe to call repeatedly.
+function ensureTouch(force = false) {
+  if (force) {
+    try { touch.proc && touch.proc.kill(); } catch (_) {}
+    touch.proc = null; touch.running = false; touchInit = null;
+  }
+  if (touch.running && touch.dev) return Promise.resolve();
+  if (!touchInit) {
+    touchInit = (async () => {
+      if (!touch.dev || force) await detectTouch();
+      startTouchStream();
+      touch.error = '';
+    })().catch((e) => { touch.error = e.message; throw e; })
+      .finally(() => { touchInit = null; });
+  }
+  return touchInit;
+}
+
+// Keep the stream alive while the device is connected.
+setInterval(() => { if (TRANSPORT === 'adb' && touch.dev && !touch.running) ensureTouch().catch(() => {}); }, 4000);
 
 // One automation job at a time, so steps from two requests never interleave
 let jobChain = Promise.resolve();
@@ -303,6 +520,10 @@ function parseUi(xml) {
 }
 
 async function dumpUi() {
+  if (TRANSPORT === 'agent') {
+    const nodes = await agentCmd({ type: 'dumpui' }, 20000);
+    return Array.isArray(nodes) ? nodes : [];
+  }
   for (let i = 0; i < 3; i++) {
     const out = await shell(
       'rm -f /sdcard/ui.xml; uiautomator dump /sdcard/ui.xml >/dev/null 2>&1; cat /sdcard/ui.xml 2>/dev/null',
@@ -341,7 +562,108 @@ async function findElement(q) {
   }
 }
 
+// Tap an element found by a selector ({id}/{text}/...).
+async function tapSelector(sel, timeout = 15000) {
+  const el = await findElement({ ...sel, timeout });
+  await shell(`input tap ${el.x} ${el.y}`);
+  return el;
+}
+
+// Type any string as key events (works in numeric fields where IME paste doesn't).
+// No stripping, no data-type checks — whatever is given goes on screen.
+async function inputChars(text) {
+  const t = String(text ?? '');
+  if (!t) return '';
+  await shell(`input text ${escapeForInput(t)}`);
+  return t;
+}
+
+// Put text on Android's clipboard. `cmd clipboard` is blocked on this ROM, so we launch
+// the Clip Setter helper app (a foreground app IS allowed to set the clipboard).
+// Space-free text (an OTP code) goes as plain --es text (proven to work on this phone);
+// anything with spaces/quotes/metachars goes base64 so the shell can't mangle it.
+async function setClipboard(text) {
+  const t = String(text ?? '');
+  const safe = t.length > 0 && !/[\s"'`$\\<>|;&(){}\[\]*?!#~=]/.test(t);
+  let cmd;
+  if (safe) {
+    cmd = `am start -n ${CLIP_ACTIVITY} --es text ${t} --activity-no-animation`;
+  } else {
+    const b64 = Buffer.from(t, 'utf8').toString('base64');
+    cmd = `am start -n ${CLIP_ACTIVITY} --es b64 ${b64} --activity-no-animation`;
+  }
+  const out = await shell(cmd);
+  if (/does not exist|unable to resolve|Error type/i.test(out || '')) {
+    throw new Error('Clip Setter app not installed on the phone (install android-build/clip-setter). ' + (out || '').trim());
+  }
+  return t;
+}
+
+// Select all text in the focused field. Ctrl+A on modern Android; falls back to Shift+Home.
+async function selectAll() {
+  try { await shell('input keycombination 113 29'); return 'ctrl-a'; } catch (_) {}
+  await shell('input keyevent 123').catch(() => {});        // MOVE_END
+  await shell('input keycombination 59 122').catch(() => {});// SHIFT + MOVE_HOME
+  return 'shift-home';
+}
+
+// Tap a fixed [x,y] coordinate, with a log line.
+async function tapXY(xy, labelStr) {
+  log('  tap ' + labelStr + ' (' + xy[0] + ',' + xy[1] + ')');
+  await dev.tap(xy[0], xy[1]);
+  await sleep(100);                 // settle: give every tap a chance to register
+}
+
+// Keep only digits (for PIN / OTP typed on the numeric keypad).
+function digitsOnly(s) {
+  return String(s ?? '').replace(/\D/g, '');
+}
+
+// A keypad key's center: use the exact measured map when present, else the computed grid.
+function keyXY(k) {
+  if (KEYPAD.keys && KEYPAD.keys[k]) return KEYPAD.keys[k];
+  const L = KEYPAD.layout, rows = L.length, cols = L[0].length;
+  let r = -1, c = -1;
+  for (let i = 0; i < rows; i++) {
+    const j = L[i].indexOf(k);
+    if (j >= 0) { r = i; c = j; break; }
+  }
+  if (r < 0) throw new Error('key not on keypad: ' + k);
+  const [x1, y1] = KEYPAD.oneXY, [x2, y2] = KEYPAD.doneXY;
+  const x = x1 + (cols > 1 ? ((x2 - x1) / (cols - 1)) * c : 0);
+  const y = y1 + (rows > 1 ? ((y2 - y1) / (rows - 1)) * r : 0);
+  return [Math.round(x), Math.round(y)];
+}
+
+// Tap a sequence of digits on the on-screen keypad. If submit, tap DONE after.
+async function tapPad(str, { submit = false } = {}) {
+  const digits = digitsOnly(str);
+  for (const ch of digits) {
+    const xy = keyXY(ch);
+    log('  key ' + ch + ' (' + xy[0] + ',' + xy[1] + ')');
+    await dev.tap(xy[0], xy[1]);
+    await sleep(KEYPAD.keyDelayMs);
+  }
+  if (submit) {
+    const d = keyXY('DONE');
+    log('  key DONE (' + d[0] + ',' + d[1] + ')');
+    await dev.tap(d[0], d[1]);
+  }
+  return digits;
+}
+
+// Armed by the PIN step; the next incoming SMS then types the OTP on the keypad.
+let awaitingOtpUntil = 0;
+const OTP_ARM_MS = 180000;
+
 async function currentScreen() {
+  if (TRANSPORT === 'agent') {
+    try {
+      const d = await agentCmd({ type: 'getscreen' }, 15000);
+      const activity = d && d.activity ? String(d.activity) : '';
+      return { package: (d && d.package) || '', activity, name: activity ? activity.split('.').pop() : 'Unknown' };
+    } catch (_) { return { package: '', activity: '', name: 'Unknown' }; }
+  }
   const out = await shell('dumpsys window | grep -m1 mCurrentFocus').catch(() => '');
   const m = out.match(/\s([\w.]+)\/([\w.$]+)\}/);
   if (m) {
@@ -361,8 +683,31 @@ function extractOtp(message) {
   return m ? m[1] : null;
 }
 
+// Send the SMS to a Telegram chat (so you copy the OTP from Telegram — the app accepts that).
+function forwardToTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    // Forward the SMS EXACTLY as received — do NOT collapse whitespace or trim.
+    // The OTP field keys on the original line break; turning it into a space breaks the paste.
+    const clean = String(text || '')
+      .replace(/[​-‍﻿ ]/g, '')   // zero-width + non-breaking spaces
+      .slice(0, 4000);   // keep the SMS as-is (newline included); only remove zero-width junk + cap length
+    const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: clean });
+    const u = new URL(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`);
+    const req = https.request(
+      { method: 'POST', hostname: u.hostname, path: u.pathname + u.search,
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } },
+      (r) => { let b = ''; r.on('data', (d) => (b += d)); r.on('end', () => {
+        if (r.statusCode !== 200) log('[telegram] HTTP ' + r.statusCode + ' ' + b.slice(0, 160));
+      }); }
+    );
+    req.on('error', (e) => log('[telegram] ' + e.message));
+    req.write(payload); req.end();
+  } catch (e) { log('[telegram] ' + e.message); }
+}
+
 function smsMatches(s, f) {
-  if (!s.otp || s.used) return false;
+  if (s.used) return false;
   if (f.from && !s.from.toLowerCase().includes(String(f.from).toLowerCase())) return false;
   if (f.contains && !s.message.toLowerCase().includes(String(f.contains).toLowerCase())) return false;
   return true;
@@ -431,21 +776,19 @@ const actions = {
   tap: async ({ x, y }) => {
     x = num(x, 'x');
     y = num(y, 'y');
-    await shell(`input tap ${x} ${y}`);
+    await dev.tap(x, y);
     return { x, y };
   },
 
   longpress: async ({ x, y, ms = 800 }) => {
     x = num(x, 'x');
     y = num(y, 'y');
-    await shell(`input swipe ${x} ${y} ${x} ${y} ${num(ms, 'ms')}`);
+    await dev.longpress(x, y, num(ms, 'ms'));
     return { x, y, ms };
   },
 
   swipe: async ({ x1, y1, x2, y2, ms = 300 }) => {
-    await shell(
-      `input swipe ${num(x1, 'x1')} ${num(y1, 'y1')} ${num(x2, 'x2')} ${num(y2, 'y2')} ${num(ms, 'ms')}`
-    );
+    await dev.swipe(num(x1, 'x1'), num(y1, 'y1'), num(x2, 'x2'), num(y2, 'y2'), num(ms, 'ms'));
     return { x1, y1, x2, y2, ms };
   },
 
@@ -467,33 +810,36 @@ const actions = {
     return { direction };
   },
 
-  // Paste text into the focused field (or into "field" if given). Any language.
+  // Type text into the focused field (or into "field" if given). Any language.
   paste: async ({ text, field, clear = false, submit }) => {
     if (field) {
       const el = await findElement(field);
-      await shell(`input tap ${el.x} ${el.y}`);
+      await dev.tap(el.x, el.y);
       await sleep(300);
     }
-    if (clear) await clearField();
-    const via = await insertText(text);
+    if (clear && TRANSPORT !== 'agent') await clearField();
+    await dev.text(text);
     await doSubmit(submit);
-    return { pasted: Array.from(String(text ?? '')).length, via };
+    return { typed: Array.from(String(text ?? '')).length };
   },
 
   // Same as paste, kept for older scripts
   text: async ({ text }) => {
-    const via = await insertText(text);
-    return { typed: Array.from(String(text ?? '')).length, via };
+    await dev.text(text);
+    return { typed: Array.from(String(text ?? '')).length };
   },
 
-  // Paste whatever is in Android's own clipboard
+  // Set the phone clipboard
+  'set-clipboard': async ({ text }) => ({ clipboard: await dev.setclip(text) }),
+
+  // Paste whatever is in the phone clipboard into the focused field
   'paste-clipboard': async () => {
-    await shell('input keyevent 279');
+    await dev.paste();
     return { pasted: 'clipboard' };
   },
 
   key: async ({ key }) => {
-    await shell(`input keyevent ${keyCode(key)}`);
+    await dev.key(key);
     return { key };
   },
 
@@ -507,22 +853,21 @@ const actions = {
     return { waited: ms };
   },
 
-  launch: async ({ package: p }) => {
-    p = pkgName(p);
-    await shell(`monkey -p ${p} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1`);
-    return { launched: p };
-  },
+  launch: async ({ package: p }) => ({ launched: await launchApp(p) }),
 
   stop: async ({ package: p }) => {
     p = pkgName(p);
-    await shell(`am force-stop ${p}`);
+    await suShell(`am force-stop ${p}`);
     return { stopped: p };
   },
 
   restart: async ({ package: p }) => {
     await actions.stop({ package: p });
     await sleep(500);
-    return actions.launch({ package: p });
+    const r = await actions.launch({ package: p });
+    await sleep(PAUSE.afterPage);
+    await tapXY(APP.afterLaunchTap, 'after-launch continue');   // always tap this after a relaunch
+    return r;
   },
 
   find: async (q) => findElement(q),
@@ -562,53 +907,751 @@ const actions = {
     return { keyboard: 'ready' };
   },
 
-  // Full registration flow: name -> mobile -> Send OTP -> wait for SMS -> fill OTP -> Verify
-  register: async ({ name, mobile, package: p, restart = REGISTER.restartFirst, otpTimeout = 120000 }) => {
-    if (!mobile) throw new Error('mobile is required');
+  // Full registration (one call): mobile -> Next -> PIN (keypad) -> Next -> wait SMS -> OTP (keypad) -> DONE
+  register: async ({ mobile, pin = PIN, otpTimeout = 120000 }) => {
+    const R = REGISTER;
     const done = [];
-    const hasPkg = !!(p || DEFAULT_PACKAGE);
-    if (restart && hasPkg) {
-      await actions.restart({ package: p });
-      await sleep(3000);
-      done.push('app restarted');
-    }
-    if (name != null && name !== '') {
-      await actions['type-into']({ ...REGISTER.nameField, value: name, timeout: 20000 });
-      done.push('name filled');
-    }
-    await actions['type-into']({ ...REGISTER.mobileField, value: String(mobile), timeout: 20000 });
-    done.push('mobile filled');
+    log('REGISTER start mobile=' + mobile + ' pin=' + pin);
 
-    if (REGISTER.sendOtpButton) {
-      await actions['tap-element']({ ...REGISTER.sendOtpButton, timeout: 15000 });
-      done.push('Send OTP tapped');
-    }
+    await tapXY(R.mobileXY, 'mobile field');
+    await sleep(400);
+    log('  type mobile:', mobile);
+    await dev.text(String(mobile ?? ''));
+    done.push('mobile entered');
+    await tapXY(R.nextMobileXY, 'Next (mobile)');
+    await sleep(R.pageWaitMs);
 
-    const otpRes = await actions['wait-otp']({
-      from: OTP_SENDER,
-      field: REGISTER.otpField,
-      submit: REGISTER.verifyButton,
-      timeout: num(otpTimeout, 'otpTimeout', 600000),
-    });
-    done.push('OTP ' + otpRes.otp + ' entered');
+    await tapXY(R.pinXY, 'PIN field');
+    await sleep(500);
+    log('  tap PIN on keypad:', pin);
+    await tapPad(String(pin));
+    done.push('pin entered');
+    await tapXY(R.nextPinXY, 'Next (pin)');
+    done.push('OTP requested');
 
-    let movedOn = null;
-    if (REGISTER.successText) {
-      try {
-        await findElement({ contains: true, text: REGISTER.successText, timeout: 15000 });
-        movedOn = true;
-      } catch {
-        movedOn = false;
+    log('  waiting for forwarded SMS…');
+    const sms = await waitForSms({ timeout: num(otpTimeout, 'otpTimeout', 600000), lookbackMs: 2000 });
+    const otp = digitsOnly(sms.message);
+    log('  tap OTP on keypad:', otp);
+    await sleep(R.pageWaitMs);
+    await tapXY(R.otpXY, 'OTP field');
+    await sleep(500);
+    await tapPad(otp);
+    if (R.otpNextXY) { await sleep(400); await tapXY(R.otpNextXY, 'Confirm (otp)'); }
+    done.push('OTP ' + otp + ' entered');
+
+    log('REGISTER done:', JSON.stringify(done));
+    return { mobile, pin, otp, steps: done };
+  },
+
+  // --- step-by-step, driven from the app ---
+  // Step 1: tap mobile field, type number, tap Next.
+  'reg-mobile': async ({ mobile }) => {
+    log('STEP mobile=' + mobile);
+    await tapXY(REGISTER.mobileXY, 'mobile field');
+    await sleep(400);
+    await dev.text(String(mobile ?? ''));
+    await tapXY(REGISTER.nextMobileXY, 'Next (mobile)');
+    return { step: 'mobile', mobile: String(mobile ?? '') };
+  },
+
+  // Step 2: tap the PIN field (shows keypad), tap each PIN digit on the keypad, tap Next.
+  'reg-pin': async ({ pin = PIN }) => {
+    log('STEP pin=' + pin);
+    await tapXY(REGISTER.pinXY, 'PIN field');
+    await sleep(500);
+    const typed = await tapPad(String(pin));      // taps the digits on the on-screen keypad
+    await tapXY(REGISTER.nextPinXY, 'Next (pin)');
+    return { step: 'pin', pin: typed };
+  },
+
+  // Step 3: enter the OTP. Modes:
+  //   'button-paste' -> EXACTLY your manual flow: Clip Setter puts the OTP on the clipboard,
+  //                     then the server taps the APP'S OWN Paste button (otpPasteXY). The app's
+  //                     own paste logic fills AND validates, so Confirm activates. DEFAULT.
+  //   'a11y-paste'   -> accessibility ACTION_PASTE (bypasses the app button; app may not validate)
+  //   'a11y'/'type'  -> accessibility ACTION_SET_TEXT with the exact text
+  'reg-otp': async ({ code, message, text }) => {
+    // A bare code is trimmed; a full SMS is kept EXACTLY as-is (line break included) so the
+    // clipboard carries what the phone received, byte-for-byte.
+    const raw = String(code ?? message ?? text ?? '');
+    const otp = code != null ? raw.trim() : raw;
+    if (!otp.trim()) throw new Error('No OTP text sent — paste the OTP in the box first');
+    const mode = REGISTER.otpMode || 'button-paste';
+    log('STEP otp=' + JSON.stringify(otp) + ' mode=' + mode);
+
+    if (mode === 'button-paste') {
+      // 1) OTP onto the clipboard (Clip Setter).  2) tap the app's own Paste button — like your hand.
+      if (!REGISTER.otpPasteXY) throw new Error('Set REGISTER.otpPasteXY to the app Paste button coordinate');
+      await dev.setclip(otp);
+      await sleep(900);                                    // let the clipboard set + return to the app
+      await tapXY(REGISTER.otpPasteXY, 'app Paste button');
+    } else {
+      await tapXY(REGISTER.otpXY, 'OTP field');            // focus the field first for the a11y paths
+      await sleep(400);
+      if (TRANSPORT === 'agent') {
+        if (mode === 'a11y' || mode === 'type') { await dev.text(otp); }
+        else { await dev.setclip(otp); await sleep(300); await dev.paste(); }
+      } else if (mode === 'a11y' || mode === 'type') {
+        const b64 = Buffer.from(otp, 'utf8').toString('base64');
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es b64 ${b64} --es mode settext -p ${CLIP_APP}`);
+      } else {
+        await setClipboard(otp);
+        await sleep(700);
+        await shell(`am broadcast -a com.baybex.clipsetter.SET_OTP --es mode paste -p ${CLIP_APP}`);
       }
     }
-    return { name, mobile, otp: otpRes.otp, movedOn, steps: done };
+
+    if (REGISTER.otpSubmit && REGISTER.otpNextXY) {
+      await sleep(1000);
+      await tapXY(REGISTER.otpNextXY, 'Submit (otp)');
+    }
+    return { step: 'otp', otp, mode };
+  },
+
+  // Test the keypad: type any digit string on it.
+  'keypad': async ({ digits, submit = false }) => ({ typed: await tapPad(digits, { submit }) }),
+
+  'input-chars': async ({ text, field }) => {
+    if (field) {
+      const el = await findElement(field);
+      await shell(`input tap ${el.x} ${el.y}`);
+      await sleep(300);
+    }
+    return { typed: await inputChars(text) };
   },
 };
+
+// =============================================================================
+//  EXTRA FLOWS:  login  /  goonesend  /  gooneout  /  gooncheck
+//
+//  Read each flow top-to-bottom like a checklist. The helpers are named in
+//  plain English so a beginner can follow along:
+//
+//      tap(x, y, "name")        -> tap once at the point (x, y)
+//      longPress(x, y, secs)    -> press and hold at (x, y) for `secs` seconds
+//      typePin("1234")          -> type a PIN on the on-screen number keypad
+//      typeInBox("017...")      -> type text into the box that is focused now
+//      wait(ms)                 -> pause for `ms` milliseconds
+//      screenName()             -> the name of the screen showing right now
+//
+//  To move a button, change ONLY the numbers in COORDS below. Nothing else.
+//
+//  IMPORTANT: numbers are TYPED, not pasted. Pasting needs the Clip Setter app,
+//  which jumps to the front and steals focus from GadgetX, so the taps that
+//  follow land on the wrong app. Typing keeps GadgetX in front the whole time.
+// =============================================================================
+
+// Every coordinate these flows use, in one place. Each is [x, y] in screen pixels.
+// COORDS and PAUSE now live in coords.js (imported at the top) — edit tap points there.
+
+// ---- tiny helpers: each one does ONE obvious thing --------------------------
+
+// Pause for a number of milliseconds.
+function wait(ms) { return sleep(ms); }
+
+// Tap once, then wait a moment so the tap has time to register.
+async function tap(x, y, name) {
+  log('  tap ' + (name || '') + ' (' + x + ',' + y + ')');
+  await dev.tap(x, y);
+  await wait(PAUSE.afterTap);
+  await stepShot('after tap ' + (name || '') + ' (' + x + ',' + y + ')');
+}
+
+// Press and hold at a point for a number of seconds.
+async function longPress(x, y, seconds, name) {
+  log('  hold ' + (name || '') + ' (' + x + ',' + y + ') for ' + seconds + 's');
+  await dev.longpress(x, y, seconds * 1000);
+  await wait(PAUSE.afterTap);
+}
+
+// Type a PIN by tapping each digit's button on the on-screen number keypad.
+async function typePin(pin) { await tapPad(digitsOnly(pin)); }
+
+// Type text straight into whatever box is focused right now (no clipboard).
+// We TYPE (not paste) because typing enters the value EXACTLY and in order, with no
+// app-switch. Pasting needs the Clip Setter app, which jumps to the front, steals focus,
+// and jumbles the order / changes the value — so we never paste for these number boxes.
+async function typeInBox(value) { await dev.text(String(value ?? '')); }
+
+// Open a box, focus it with a tap, then type the value straight in.
+async function openAndType(openXY, fieldXY, value, name) {
+  await tap(openXY[0], openXY[1], 'open ' + name);
+  await tap(fieldXY[0], fieldXY[1], 'focus ' + name);
+  await typeInBox(value);
+  await stepShot('typed ' + name + ' = ' + value);
+  await wait(PAUSE.afterType);
+}
+
+// ---- DEBUG: save a screenshot after each step so we can SEE what the screen shows ----
+// Turn it on with POST /api/debug {on:true} (or the dashboard button), run a flow, then
+// open  http://<server>:3900/shots  to view every step's screenshot in order.
+let DEBUG_SHOTS = false;
+const SHOTS = [];                 // recent screenshots: { n, name, at, img(dataURL) }
+async function stepShot(name) {
+  if (!DEBUG_SHOTS) return;
+  try {
+    const buf = await dev.screenshot();
+    SHOTS.push({ n: SHOTS.length + 1, name, at: new Date().toLocaleTimeString(), img: 'data:image/png;base64,' + buf.toString('base64') });
+    while (SHOTS.length > 40) SHOTS.shift();
+  } catch (e) { log('shot failed: ' + e.message); }
+}
+async function flowDebug({ on = true } = {}) {
+  DEBUG_SHOTS = !!on;
+  if (on) SHOTS.length = 0;       // start a fresh set
+  log('debug screenshots ' + (on ? 'ON — open /shots after a run' : 'OFF'));
+  return { debugShots: DEBUG_SHOTS, viewAt: '/shots' };
+}
+
+// The name of the screen (Activity) in front right now.
+async function screenName() { const s = await currentScreen().catch(() => null); return s ? s.name : '?'; }
+
+// ---- outcome verification (success / failed / stuck) ------------------------
+// A "stuck" = the server did its taps but the screen would not move on.
+class StuckError extends Error { constructor(m) { super(m); this.name = 'StuckError'; this.stuck = true; } }
+
+// A cheap fingerprint of the current screen: the Activity name + how many UI nodes it has.
+async function screenSig() {
+  const name = await screenName();
+  let n = -1;
+  try { const u = await dumpUi(); n = Array.isArray(u) ? u.length : -1; } catch (_) {}
+  return name + '#' + n;
+}
+
+// A page-CHANGING tap: tap, then wait for the screen to actually change. Re-tap a few times;
+// if it still won't move, throw StuckError (so the operation is reported as stuck, not "ok").
+async function tapExpectChange(xy, name, opts = {}) {
+  const retries = opts.retries != null ? opts.retries : VERIFY.stepRetries;
+  const waitMs  = opts.waitMs  != null ? opts.waitMs  : VERIFY.stepChangeMs;
+  const before = await screenSig();
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    await tap(xy[0], xy[1], name + (attempt ? ' (retry ' + attempt + ')' : ''));
+    const start = Date.now();
+    while (Date.now() - start < waitMs) {
+      await wait(400);
+      if ((await screenSig()) !== before) return;        // screen moved on → good
+    }
+  }
+  throw new StuckError('stuck at "' + name + '": screen did not change after ' + (retries + 1) + ' taps');
+}
+
+// Keep a few recent "what was on screen when it got stuck" screenshots, served at /shot/:id.
+const outcomeShots = new Map();   // id -> { at, img(Buffer), type }
+let outcomeShotSeq = 0;
+async function saveOutcomeShot() {
+  const buf = await dev.screenshot();
+  const id = 's' + (++outcomeShotSeq);
+  outcomeShots.set(id, { at: Date.now(), img: buf, type: TRANSPORT === 'agent' ? 'image/jpeg' : 'image/png' });
+  while (outcomeShots.size > 120) outcomeShots.delete(outcomeShots.keys().next().value);
+  return id;
+}
+
+// ---- the flows --------------------------------------------------------------
+
+// LOGIN: a PIN is given. Open the PIN box, type the PIN, tap Login.
+// If the screen name changes afterwards, the login worked.
+async function flowLogin({ pin } = {}) {
+  if (!digitsOnly(pin)) throw new Error('login: please provide a PIN');
+  const C = COORDS.login;
+  log('FLOW login');
+  const before = await screenName();
+
+  await tap(C.openPin[0], C.openPin[1], 'open PIN');
+  await typePin(pin);
+  await wait(PAUSE.afterType);
+  await tap(C.submit[0], C.submit[1], 'Login');
+  await wait(PAUSE.afterPage);
+
+  const after = await screenName();
+  return { flow: 'login', success: after !== before, before, after };
+}
+
+// GO ONE (used by both goonesend and gooneout — only the first tap is different).
+// Pages:  page 1 has NUMBER 1  ->  a tap opens the NUMBER 2 page  ->  then PIN page -> etc.
+// Steps:  entry -> type number1 -> go to page 2 (WAIT) -> type number2 -> confirm ->
+//         next -> type PIN -> next -> hold 4s -> final tap.
+async function flowGoOne({ number1, number2, pin, mobile, entry, label }) {
+  const n1 = String(number1 ?? '');
+  const n2 = String(number2 ?? '');
+  if (!n1.trim())       throw new Error(label + ': number1 is required');
+  if (!n2.trim())       throw new Error(label + ': number2 is required');
+  if (!digitsOnly(pin)) throw new Error(label + ': pin is required');
+  const C = COORDS.goone;
+  log('FLOW ' + label + ' number1=' + n1 + ' number2=' + n2);
+
+  // 0) make sure we are on HOME first (logs in / registers if needed, using the same PIN)
+  await ensureHome(pin, { mobile });
+
+  // 1) open the section
+  await tap(entry[0], entry[1], 'entry');
+  await wait(PAUSE.afterPage);
+
+  // 2) NUMBER 1 is on THIS page — open its box, focus it, type the number in
+  await openAndType(C.number1Open, C.number1Field, n1, 'number1');
+  await wait(PAUSE.afterNumber1);   // let the page settle after number 1
+
+  // 3) this tap LEAVES page 1 and opens the NUMBER 2 page — VERIFY the page actually changed
+  await tapExpectChange(C.number2Open, 'go to number2 page');
+  await wait(PAUSE.number2PageLoad);
+
+  // 4) NUMBER 2 page — tap it first, long-press the box to focus, type the number, then confirm
+  await tap(C.number2PageTap[0], C.number2PageTap[1], 'number2 first tap');
+  await longPress(C.number2Field[0], C.number2Field[1], 1, 'focus number2');
+  await typeInBox(n2);
+  await wait(PAUSE.afterType);
+  await tap(C.number2Confirm[0], C.number2Confirm[1], 'confirm number2');
+
+  // 5) submit both numbers -> next page (VERIFY it advanced)
+  await tapExpectChange(C.numbersNext, 'numbers next');
+
+  // 6) PIN on the next page
+  await tap(C.pinField[0], C.pinField[1], 'PIN box');
+  await typePin(pin);
+  await wait(PAUSE.afterType);
+  await tapExpectChange(C.pinNext, 'PIN next');          // VERIFY the PIN page advanced
+
+  // 7) press and hold, then the final tap
+  await longPress(C.holdSpot[0], C.holdSpot[1], C.holdSeconds, 'hold');
+  await wait(PAUSE.afterPage);
+  await tap(C.finalTap[0], C.finalTap[1], 'final');
+
+  return { flow: label, number1: n1, number2: n2 };
+}
+// Check the inputs right away (so a missing field gives an instant error).
+function checkGoOneInputs({ number1, number2, pin } = {}, label) {
+  if (!String(number1 ?? '').trim()) throw new Error(label + ': number1 is required');
+  if (!String(number2 ?? '').trim()) throw new Error(label + ': number2 is required');
+  if (!digitsOnly(pin))              throw new Error(label + ': pin is required');
+}
+
+// Start a long flow on the phone in the BACKGROUND and return straight away.
+// Why: the goone flow takes ~20 seconds (a 4-second hold plus several page waits).
+// If we made the browser wait that whole time, a timeout could cut the request off
+// before the flow finished. Running it in the background lets every step complete.
+// (It still runs one-at-a-time, through the same `exclusive` queue as everything else.)
+function startInBackground(runFlow, label) {
+  exclusive(runFlow)
+    .then(() => log('[background] ' + label + ' finished'))
+    .catch((e) => log('[background] ' + label + ' failed: ' + e.message));
+  return { started: true, flow: label, note: 'running on the phone — watch the phone' };
+}
+
+function flowGoOneSend(body = {}) {
+  checkGoOneInputs(body, 'goonesend');
+  return startInBackground(() => flowGoOne({ ...body, entry: COORDS.goone.entrySend, label: 'goonesend' }), 'goonesend');
+}
+function flowGoOneOut(body = {}) {
+  checkGoOneInputs(body, 'gooneout');
+  return startInBackground(() => flowGoOne({ ...body, entry: COORDS.goone.entryOut, label: 'gooneout' }), 'gooneout');
+}
+
+// CHECK: tap the row, read the screen, return just the number on that row.
+async function flowGoOneCheck({ pin, mobile } = {}) {
+  const C = COORDS.check;
+  log('FLOW gooncheck');
+  // make sure we are on HOME first (logs in with the PIN if needed)
+  await ensureHome(pin, { mobile });
+  await tap(C.row[0], C.row[1], 'check row');
+  await wait(PAUSE.afterPage);
+
+  const nodes = await dumpUi().catch(() => []);
+  const rowY = C.row[1];
+  const onThisRow = nodes.filter((n) => n.text && n.bounds[1] <= rowY && rowY <= n.bounds[3]);
+  const rowText = onThisRow.map((n) => n.text).join(' ').trim();
+
+  // Keep only the number (drop the ৳ symbol and any thousands commas).
+  const grabNumber = (s) => (String(s).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/) || [''])[0];
+  const allTextJoined = nodes.filter((n) => n.text).map((n) => n.text).join(' ');
+  const number = grabNumber(rowText) || grabNumber(allTextJoined);
+
+  return {
+    flow: 'gooncheck',
+    number,                                                 // just the number, e.g. "62.65"
+    rowText,
+    allText: nodes.filter((n) => n.text).map((n) => n.text),
+  };
+}
+
+// INPUT1 only — test the "number 1" box on its own: open it, focus it, type the number.
+// (Starts from the number1 box; it does NOT tap the entry button first.)
+async function flowInput1({ number1 } = {}) {
+  const n1 = String(number1 ?? '');
+  if (!n1.trim()) throw new Error('input1: number1 is required');
+  log('FLOW input1 number1=' + n1);
+  await openAndType(COORDS.goone.number1Open, COORDS.goone.number1Field, n1, 'number1');
+  return { flow: 'input1', number1: n1 };
+}
+
+// SHOW TAP MARKS — turn Android's on-screen touch markers on or off.
+// When ON you can watch exactly where each automated tap lands:
+//   • "pointer location" draws a crosshair + shows the live X,Y at the top of the screen
+//   • "show touches" draws a circle at every touch (including our injected taps)
+// Use it to debug a wrong coordinate: turn it on, run a flow, watch the marks.
+async function flowShowTouches({ on = true } = {}) {
+  const v = on ? 1 : 0;
+  await suShell(`settings put system pointer_location ${v}`);   // crosshair + X,Y readout
+  await suShell(`settings put system show_touches ${v}`);       // circle at each touch
+  log('tap marks ' + (on ? 'ON' : 'OFF'));
+  return { tapMarks: !!on };
+}
+
+// =============================================================================
+//  DECISION LAYER — know which screen we're on and always get back to HOME first
+//
+//  The app uses one Activity per screen, so we decide on the Activity NAME
+//  (language-independent). Every operation (send / out / check) needs HOME first:
+//    • already on HOME            -> just run it
+//    • on the LOGIN screen        -> log in with the PIN, then run it
+//    • on the CHECK-STATUS screen -> registration is needed -> register, then run it
+//    • on anything else           -> press Back until HOME
+//  The PIN is given ONCE in the request and reused everywhere it's needed
+//  (login + the flow's own PIN step) — never asked twice.
+// =============================================================================
+// APP (screen names + reset taps) now lives in coords.js (imported at the top).
+
+// Do the LOGIN screen: open the PIN box, type the PIN, submit.
+async function loginSteps(pin) {
+  if (!digitsOnly(pin)) throw new Error('login needs a PIN');
+  const C = COORDS.login;
+  log('  [login] entering PIN');
+  await tap(C.openPin[0], C.openPin[1], 'login: open PIN');
+  await typePin(pin);
+  await wait(PAUSE.afterType);
+  await tap(C.submit[0], C.submit[1], 'login: submit');
+  await wait(PAUSE.afterPage);
+}
+
+// Do the REGISTER steps (assumes the app is already on the registration screen):
+// mobile -> PIN -> wait for the OTP SMS -> clipboard-paste it + Confirm -> 2 taps to Home.
+async function registerSteps({ mobile, pin }) {
+  if (!String(mobile ?? '').trim()) throw new Error('register needs a mobile number');
+  if (!digitsOnly(pin))             throw new Error('register needs a PIN');
+  const R = REGISTER;
+  log('  [register] mobile=' + mobile);
+  // mobile
+  await tapXY(R.mobileXY, 'mobile field'); await sleep(400);
+  await dev.text(String(mobile));
+  await tapXY(R.nextMobileXY, 'Next (mobile)'); await sleep(R.pageWaitMs);
+  // PIN (on-screen keypad) -> requests the OTP
+  await tapXY(R.pinXY, 'PIN field'); await sleep(500);
+  await tapPad(digitsOnly(pin));
+  await tapXY(R.nextPinXY, 'Next (pin)');
+  // OTP: wait for the forwarded SMS, put it on the clipboard, tap the app Paste button, Confirm
+  log('  [register] waiting for the OTP SMS…');
+  const sms = await waitForSms({ timeout: 120000, lookbackMs: 2000 });
+  await sleep(R.pageWaitMs);
+  await dev.setclip(sms.message);                      // exact SMS on the clipboard
+  await sleep(900);
+  await tapXY(R.otpPasteXY, 'app Paste button');
+  await sleep(1000);
+  await tapXY(R.otpNextXY, 'Confirm (otp)');
+  // two extra taps land on Home
+  await sleep(R.pageWaitMs);
+  await tapXY(APP.regToHome1, 'register -> home 1');
+  await sleep(150);
+  await tapXY(APP.regToHome2, 'register -> home 2');
+  await wait(PAUSE.afterPage);
+  return { registered: true, mobile };
+}
+
+// Keep tapping/navigating until we are on HOME (or give up with a clear error).
+async function ensureHome(pin, { mobile } = {}) {
+  for (let i = 0; i < 6; i++) {
+    const name = await screenName();
+    log('  [ensureHome] on ' + name);
+    if (name === APP.screens.home) return name;
+    if (name === APP.screens.login) { await loginSteps(pin); continue; }
+    if (name === APP.screens.checkStatus) {
+      await wait(1500);                                 // let the router auto-forward
+      if ((await screenName()) === APP.screens.checkStatus) {
+        if (!mobile) throw new Error('Registration needed (on ' + name + ') but no mobile number was given — use Register (mobile + PIN).');
+        await registerSteps({ mobile, pin });
+      }
+      continue;
+    }
+    await dev.key('BACK'); await wait(900);             // unknown page -> step back toward Home
+  }
+  const final = await screenName();
+  if (final !== APP.screens.home) throw new Error('Could not reach Home (stuck on ' + final + ')');
+  return final;
+}
+
+// Grant every permission the app declares (so NO permission dialog appears after a fresh launch).
+async function grantAllPermissions(pkg) {
+  let out = '';
+  try { out = await suShell(`dumpsys package ${pkg}`); } catch (_) {}
+  const perms = new Set(out.match(/android\.permission\.[A-Z_]+/g) || []);
+  ['READ_SMS','RECEIVE_SMS','SEND_SMS','POST_NOTIFICATIONS','READ_CONTACTS','CAMERA',
+   'READ_EXTERNAL_STORAGE','WRITE_EXTERNAL_STORAGE','ACCESS_FINE_LOCATION','ACCESS_COARSE_LOCATION',
+   'READ_PHONE_STATE','RECORD_AUDIO','READ_PHONE_NUMBERS']
+    .forEach((p) => perms.add('android.permission.' + p));
+  let granted = 0;
+  for (const p of perms) {
+    const r = await suShell(`pm grant ${pkg} ${p} 2>&1`).catch((e) => e.message || '');
+    if (!/Error|Exception|not a changeable|Unknown permission|not declared|Operation/i.test(r || '')) granted++;
+  }
+  log('  [permissions] granted ~' + granted + ' of ' + perms.size);
+  return granted;
+}
+
+// START OVER: force-stop, wipe the app data, grant ALL permissions, relaunch. No inputs.
+// A clean slate — after this the app opens fresh (you'll land on the register/check screen).
+async function flowStartOver(pkg = APP.pkg) {
+  log('FLOW start-over on ' + pkg + ': force-stop + clear data + grant + launch');
+  await suShell(`am force-stop ${pkg}`);
+  await suShell(`pm clear ${pkg}`);
+  const granted = await grantAllPermissions(pkg);
+  await launchApp(pkg);
+  await wait(PAUSE.afterPage);
+  await tapXY(APP.afterLaunchTap, 'after-launch continue');   // one tap after the fresh launch
+  await wait(PAUSE.afterPage);
+  return { startedOver: true, granted, launched: pkg };
+}
+
+// REGISTER route: wipe app data -> grant all permissions -> launch -> run the register steps.
+async function flowRegister({ mobile, pin, pkg = APP.pkg } = {}) {
+  if (!String(mobile ?? '').trim()) throw new Error('register: mobile is required');
+  if (!digitsOnly(pin))             throw new Error('register: pin is required');
+  log('FLOW register on ' + pkg + ' (wipe + grant + launch) mobile=' + mobile);
+  await suShell(`pm clear ${pkg}`);                     // wipe all app data
+  await grantAllPermissions(pkg);                       // pre-grant BEFORE launch
+  await launchApp(pkg);
+  await wait(PAUSE.afterPage * 2);                      // let it start
+  await grantAllPermissions(pkg);                       // again, in case more were requested on first run
+  await wait(PAUSE.afterPage);
+  await tapXY(APP.afterLaunchTap, 'after-launch continue');   // one tap after the fresh launch
+  await wait(PAUSE.afterPage);
+  await registerSteps({ mobile, pin });
+  return { flow: 'register', mobile, pkg };
+}
+
+// Make each flow callable as POST /api/<name>.
+Object.assign(actions, {
+  login:          flowLogin,
+  goonesend:      flowGoOneSend,
+  gooneout:       flowGoOneOut,
+  gooncheck:      flowGoOneCheck,
+  input1:         flowInput1,
+  register:       (body = {}) => {
+                    if (!String(body.mobile ?? '').trim()) throw new Error('register: mobile is required');
+                    if (!digitsOnly(body.pin))             throw new Error('register: pin is required');
+                    return startInBackground(() => flowRegister(body), 'register');
+                  },
+  grant:          () => grantAllPermissions(APP.pkg).then((n) => ({ granted: n })),
+  startover:      flowStartOver,
+  reset:          flowStartOver,
+  'show-touches': flowShowTouches,
+  debug:          flowDebug,
+});
+
+// =============================================================================
+//  MULTI-INSTANCE (cloned apps) + PostgreSQL
+//
+//  You install the same app many times with a cloner (each clone is its own
+//  PACKAGE). We store one row per clone: its package + the mobile/PIN saved at
+//  registration. A request names an instance; the server opens THAT clone and
+//  runs the operation on it (only one app is foreground at a time, so runs are
+//  serialized through the same `exclusive` queue).
+// =============================================================================
+let pool = null, pgError = null;
+try { const { Pool } = require('pg'); pool = new Pool({ connectionString: DATABASE_URL }); }
+catch (e) { pgError = e.message; console.error('[db] pg not available: ' + e.message + ' — run: npm install pg'); }
+
+async function initDb() {
+  if (!pool) return;
+  await pool.query(`CREATE TABLE IF NOT EXISTS instances (
+    id SERIAL PRIMARY KEY,
+    label        TEXT NOT NULL,
+    package      TEXT NOT NULL UNIQUE,
+    mobile       TEXT,
+    pin          TEXT,
+    status       TEXT NOT NULL DEFAULT 'new',
+    last_balance TEXT,
+    note         TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  // outcome + Dual-Space icon columns (added if missing, so old databases upgrade cleanly)
+  for (const col of ['last_action TEXT', 'last_status TEXT', 'last_detail TEXT', 'last_shot TEXT',
+                     'last_op_at TIMESTAMPTZ', 'open_x INTEGER', 'open_y INTEGER']) {
+    await pool.query(`ALTER TABLE instances ADD COLUMN IF NOT EXISTS ${col}`);
+  }
+  console.log('[db] instances table ready');
+}
+
+const db = {
+  list:   ()        => pool.query('SELECT * FROM instances ORDER BY id').then((r) => r.rows),
+  get:    (id)      => pool.query('SELECT * FROM instances WHERE id=$1', [id]).then((r) => r.rows[0]),
+  add:    (label, pkg) => pool.query(
+            `INSERT INTO instances(label,package) VALUES($1,$2)
+             ON CONFLICT(package) DO UPDATE SET label=EXCLUDED.label, updated_at=now() RETURNING *`,
+            [label, pkg]).then((r) => r.rows[0]),
+  edit:   (id, f)   => pool.query(
+            `UPDATE instances SET label=COALESCE($2,label), mobile=COALESCE($3,mobile),
+             pin=COALESCE($4,pin), note=COALESCE($5,note),
+             open_x=COALESCE($6,open_x), open_y=COALESCE($7,open_y), updated_at=now()
+             WHERE id=$1 RETURNING *`,
+            [id, f.label ?? null, f.mobile ?? null, f.pin ?? null, f.note ?? null,
+             f.open_x != null ? parseInt(f.open_x, 10) : null, f.open_y != null ? parseInt(f.open_y, 10) : null]
+            ).then((r) => r.rows[0]),
+  saveCreds: (id, mobile, pin) => pool.query(
+            `UPDATE instances SET mobile=$2, pin=$3, status='registered', updated_at=now() WHERE id=$1 RETURNING *`,
+            [id, mobile, pin]).then((r) => r.rows[0]),
+  saveBalance: (id, bal) => pool.query(
+            `UPDATE instances SET last_balance=$2, updated_at=now() WHERE id=$1`, [id, bal]),
+  setStatus: (id, st) => pool.query(
+            `UPDATE instances SET status=$2, updated_at=now() WHERE id=$1`, [id, st]),
+  saveOutcome: (id, action, res) => pool.query(
+            `UPDATE instances SET last_action=$2, last_status=$3, last_detail=$4, last_shot=$5,
+             last_op_at=now(), updated_at=now() WHERE id=$1`,
+            [id, action, res.outcome || '', res.detail || '', res.shot || null]),
+  remove: (id)      => pool.query('DELETE FROM instances WHERE id=$1', [id]),
+};
+function needDb() { if (!pool) throw new Error('Postgres not set up: run `npm install pg` and set DATABASE_URL'); }
+
+// Open a specific clone and make sure the app is in front before we drive it.
+async function openInstance(inst) {
+  const appScreens = Object.values(APP.screens);   // the app's known screen names
+  if (DUAL.enabled) {
+    // Dual Space mode: launch Dual Space, then tap THIS clone's icon.
+    if (inst.open_x == null || inst.open_y == null) {
+      throw new Error('instance #' + inst.id + ' has no Dual Space icon position — set its X,Y in /admin');
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await launchApp(DUAL.pkg);                     // open Dual Space
+      await wait(DUAL.launchWaitMs);
+      await tap(inst.open_x, inst.open_y, 'open clone #' + inst.id + ' icon');
+      await wait(DUAL.openWaitMs);
+      // confirm we actually entered the app (one of its known screens is showing)
+      for (let i = 0; i < 3; i++) {
+        if (appScreens.includes(await screenName())) return;
+        await wait(1200);
+      }
+    }
+    throw new StuckError('could not open clone #' + inst.id + ' from Dual Space (icon tap did not open the app)');
+  }
+  // App Cloner mode: each clone is its own package — launch it directly.
+  await launchApp(inst.package);
+  await wait(PAUSE.afterPage);
+  const scr = await currentScreen().catch(() => ({}));
+  if (scr.package && inst.package && !String(scr.package).startsWith(inst.package)) {
+    await launchApp(inst.package);
+    await wait(PAUSE.afterPage);
+  }
+}
+
+// Run ONE operation on ONE instance. Uses the instance's saved mobile/PIN unless the
+// request overrides them. Register/Start-Over target the clone's package directly.
+// Read the balance safely (ensure Home, tap the row, read the number). null if unreadable.
+async function readBalance(b) {
+  const r = await flowGoOneCheck(b).catch(() => null);
+  return r && r.number ? r.number : null;
+}
+
+// SEND / OUT, verified by the balance actually changing (ground truth, language-independent).
+async function runMoneyOp(inst, action, b) {
+  let before = null;
+  if (VERIFY.verifyByBalance) before = await readBalance(b);           // balance BEFORE
+  const entry = action === 'goonesend' ? COORDS.goone.entrySend : COORDS.goone.entryOut;
+  await flowGoOne({ ...b, entry, label: action });                     // may throw StuckError if a page won't move
+  await wait(VERIFY.settleMs);
+  if (!VERIFY.verifyByBalance) return { outcome: 'done', detail: 'completed taps (balance verify off)' };
+  const after = await readBalance(b);                                  // balance AFTER
+  if (after != null) await db.saveBalance(inst.id, after);
+  if (before != null && after != null) {
+    return after !== before
+      ? { outcome: 'success', detail: 'balance changed ' + before + ' → ' + after, balanceBefore: before, balanceAfter: after }
+      : { outcome: 'failed',  detail: 'balance unchanged (' + after + ') — operation did not go through', balanceBefore: before, balanceAfter: after };
+  }
+  if (after != null) return { outcome: 'done', detail: 'completed; balance now ' + after + ' (no before to compare)', balanceAfter: after };
+  return { outcome: 'stuck', detail: 'taps completed but balance could not be read to confirm' };
+}
+
+// Run ONE operation on ONE instance and return a clear OUTCOME:
+//   success = verified it worked   failed = reached a known bad end (e.g. balance unchanged)
+//   stuck   = taps done but screen wouldn't progress   error = device/other error
+async function doInstanceAction(inst, action, body = {}) {
+  const b = { pin: inst.pin, mobile: inst.mobile, ...body };
+  let res;
+  try {
+    if (action === 'register') {
+      if (DUAL.enabled) {
+        await openInstance(inst);                                     // open the (fresh) clone via its icon
+        await registerSteps({ mobile: b.mobile, pin: b.pin });        // no pm-clear — a Dual Space clone starts fresh
+      } else {
+        await flowRegister({ mobile: b.mobile, pin: b.pin, pkg: inst.package });
+      }
+      await db.saveCreds(inst.id, b.mobile, b.pin);                    // remember the number + PIN
+      await wait(VERIFY.settleMs);
+      const name = await screenName();
+      res = name === APP.screens.home
+        ? { outcome: 'success', detail: 'registered, reached Home', mobile: b.mobile }
+        : { outcome: 'stuck', detail: 'registered but did not reach Home (on ' + name + ')' };
+    } else if (action === 'startover') {
+      if (DUAL.enabled) {
+        if (!Array.isArray(DUAL.clearSteps) || !DUAL.clearSteps.length) {
+          throw new Error('Dual Space "clear data" is not configured — set DUAL_SPACE.clearSteps in config.js (record the taps with /tapsfinder), or clear the clone by hand in Dual Space.');
+        }
+        if (inst.open_x == null || inst.open_y == null) throw new Error('set this instance\'s icon X,Y first');
+        await launchApp(DUAL.pkg);
+        await wait(DUAL.launchWaitMs);
+        await longPress(inst.open_x, inst.open_y, Math.round((DUAL.clearLongPressMs || 1200) / 1000), 'long-press clone icon');
+        for (const step of DUAL.clearSteps) { await tap(step[0], step[1], 'clear step'); await wait(700); }
+        await db.setStatus(inst.id, 'new');
+        res = { outcome: 'success', detail: 'cleared clone data via Dual Space' };
+      } else {
+        await flowStartOver(inst.package);
+        res = { outcome: 'success', detail: 'app wiped & relaunched' };
+      }
+    } else if (action === 'gooncheck') {
+      await openInstance(inst);
+      const n = await readBalance(b);
+      res = n != null
+        ? (await db.saveBalance(inst.id, n), { outcome: 'success', balance: n, detail: 'balance = ' + n })
+        : { outcome: 'stuck', detail: 'could not read the balance' };
+    } else if (action === 'login') {
+      await openInstance(inst);
+      const r = await flowLogin(b);
+      res = r.success
+        ? { outcome: 'success', detail: 'logged in' }
+        : { outcome: 'failed', detail: 'login did not reach Home (on ' + r.after + ') — wrong PIN?' };
+    } else if (action === 'goonesend' || action === 'gooneout') {
+      await openInstance(inst);
+      res = await runMoneyOp(inst, action, b);
+    } else if (action === 'input1') {
+      await openInstance(inst);
+      await flowInput1(b);
+      res = { outcome: 'success', detail: 'typed number1' };
+    } else {
+      throw new Error('unknown instance action: ' + action);
+    }
+  } catch (e) {
+    res = (e && e.stuck) ? { outcome: 'stuck', detail: e.message } : { outcome: 'error', detail: e.message };
+  }
+
+  // For anything that isn't a clean success, grab a screenshot so you can SEE what happened.
+  if (res.outcome !== 'success') { try { res.shot = await saveOutcomeShot(); } catch (_) {} }
+  // Remember the outcome on the instance row.
+  await db.saveOutcome(inst.id, action, res).catch(() => {});
+  // Leave the phone on a clean state (Home) for the NEXT instance — best effort.
+  try { await ensureHome(b.pin, { mobile: b.mobile }); } catch (_) {}
+
+  return { action, instance: inst.id, ...res };
+}
 
 // ---------------------------- HTTP ----------------------------
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Log every request coming in and its response going out (skip the screenshot polling).
+app.use((req, res, next) => {
+  if (req.path === '/api/screenshot') return next();
+  const t = Date.now();
+  log('→', req.method, req.path);
+  res.on('finish', () => log('←', res.statusCode, req.path, Date.now() - t + 'ms'));
+  next();
+});
 
 function auth(req, res, next) {
   const key = String(req.get('x-api-key') || req.query.key || '');
@@ -621,14 +1664,145 @@ function auth(req, res, next) {
 }
 
 app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
+app.get('/flow', (req, res) => res.type('html').send(FLOW_HTML));
+app.get('/tapsfinder', (req, res) => res.type('html').send(FINDER_HTML));
+app.get('/mydashboard', (req, res) => res.type('html').send(MYDASH_HTML));
+app.get('/mydashborad', (req, res) => res.type('html').send(MYDASH_HTML)); // alias (alt spelling)
+
+// Debug gallery: every step's screenshot, newest run. Turn capture on with POST /api/debug {on:true}.
+app.get('/shots', (req, res) => {
+  const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const body = SHOTS.length
+    ? SHOTS.map((s) => `<figure><figcaption>#${s.n} — ${esc(s.name)} <span>${esc(s.at)}</span></figcaption><img src="${s.img}"></figure>`).join('')
+    : '<p style="color:#8a95a0">No screenshots yet. Turn debug ON (dashboard or POST /api/debug {on:true}), run a flow, then refresh.</p>';
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Step screenshots</title><style>
+body{margin:0;background:#0f1419;color:#e6eaee;font:15px system-ui,sans-serif;padding:16px}
+h1{font-size:18px} .g{display:flex;flex-wrap:wrap;gap:16px}
+figure{margin:0;background:#1a212a;border:1px solid #2a333d;border-radius:10px;padding:8px;max-width:300px}
+figcaption{font-size:12px;margin-bottom:6px}figcaption span{color:#8a95a0}
+img{width:100%;height:auto;border-radius:6px;display:block}
+</style></head><body>
+<h1>Step screenshots (${SHOTS.length}) <a href="/shots" style="color:#2f6fed;font-size:13px">refresh</a></h1>
+<div class="g">${body}</div></body></html>`);
+});
+
+app.get('/admin', (req, res) => res.type('html').send(ADMIN_HTML));
+
+// Serve an outcome screenshot (what was on screen when an op finished stuck/failed).
+app.get('/shot/:id', (req, res) => {
+  const s = outcomeShots.get(req.params.id);
+  if (!s) return res.status(404).send('no such shot');
+  res.type(s.type).send(s.img);
+});
+
 app.use('/api', auth);
+
+// ---- instances (cloned apps): list / add / edit / delete / scan / run-one-op ----
+app.get('/api/instances', async (req, res) => {
+  try { needDb(); res.json({ ok: true, instances: await db.list() }); }
+  catch (e) { res.json({ ok: false, error: e.message }); }
+});
+app.get('/api/mode', (req, res) => res.json({ ok: true, dual: !!DUAL.enabled, dualPkg: DUAL.pkg, appPkg: DEFAULT_PACKAGE }));
+app.post('/api/instances', async (req, res) => {
+  try {
+    needDb();
+    const body = req.body || {};
+    const label = (body.label || '').trim();
+    let pkg = (body.package || '').trim();
+    if (!pkg) {
+      if (DUAL.enabled) pkg = 'dual:' + (label || ('slot-' + Date.now()));   // dual clones share the app pkg; synthetic unique key
+      else throw new Error('package is required');
+    }
+    const inst = await db.add(label || pkg, pkg);
+    if (body.open_x != null || body.open_y != null || body.mobile || body.pin) {
+      await db.edit(inst.id, { open_x: body.open_x, open_y: body.open_y, mobile: body.mobile, pin: body.pin });
+    }
+    res.json({ ok: true, instance: await db.get(inst.id) });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+app.patch('/api/instances/:id', async (req, res) => {
+  try { needDb(); res.json({ ok: true, instance: await db.edit(req.params.id, req.body || {}) }); }
+  catch (e) { res.json({ ok: false, error: e.message }); }
+});
+app.delete('/api/instances/:id', async (req, res) => {
+  try { needDb(); await db.remove(req.params.id); res.json({ ok: true }); }
+  catch (e) { res.json({ ok: false, error: e.message }); }
+});
+// discover installed clone packages on the phone (pm list packages | grep <filter>)
+app.post('/api/instances/scan', async (req, res) => {
+  try {
+    const filter = String((req.body && req.body.filter) || 'gadget').replace(/[^\w.]/g, '');
+    const out = await shell(`pm list packages | grep -i ${filter}`).catch(() => '');
+    res.json({ ok: true, packages: (out.match(/package:(\S+)/g) || []).map((s) => s.replace('package:', '')) });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+// The job SCHEDULER status (all operations run through the queue, one at a time).
+app.get('/api/jobs', (req, res) => res.json({ ok: true, jobs: queue.list(Number(req.query.limit) || 60), stats: queue.stats() }));
+app.get('/api/jobs/:id', (req, res) => {
+  const j = queue.get(req.params.id);
+  if (!j) return res.status(404).json({ ok: false, error: 'job not found' });
+  res.json({ ok: true, job: j });
+});
+
+// run ONE operation on ONE instance — QUEUED (returns a job id immediately; runs in turn).
+app.post('/api/i/:id/:action', async (req, res) => {
+  try {
+    needDb();
+    const inst = await db.get(req.params.id);
+    if (!inst) return res.status(404).json({ ok: false, error: 'instance not found' });
+    const action = req.params.action, body = req.body || {};
+    const job = queue.enqueue(
+      { action, instance: inst.id, label: action + ' #' + inst.id + ' (' + inst.label + ')' },
+      () => doInstanceAction(inst, action, body)
+    );
+    res.json({ ok: true, job });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// ---- agent transport endpoints (the phone app talks to these) ----
+// The phone long-polls for the next command.
+app.get('/api/agent/poll', (req, res) => {
+  agentLastSeen = Date.now();
+  if (agentQ.length) return res.json({ cmd: agentQ.shift() });
+  if (agentWaiter) { try { agentWaiter.res.json({}); } catch (_) {} clearTimeout(agentWaiter.timer); }
+  const timer = setTimeout(() => { if (agentWaiter && agentWaiter.res === res) agentWaiter = null; try { res.json({}); } catch (_) {} }, 30000);
+  agentWaiter = { res, timer };
+  req.on('close', () => { if (agentWaiter && agentWaiter.res === res) { clearTimeout(timer); agentWaiter = null; } });
+});
+// The phone posts the result of a command.
+app.post('/api/agent/result', (req, res) => {
+  agentLastSeen = Date.now();
+  const { id, ok, data, error } = req.body || {};
+  const p = agentPending.get(id);
+  if (p) {
+    clearTimeout(p.timer); agentPending.delete(id);
+    if (ok) p.resolve(data); else p.reject(new Error(error || 'agent action failed'));
+  }
+  res.json({ ok: true });
+});
 
 app.get('/api/status', async (req, res) => {
   try {
+    if (TRANSPORT === 'agent') {
+      // health comes from the phone app's poll heartbeat (no adb)
+      let screen = null;
+      if (agentOnline()) { try { await agentCmd({ type: 'ping' }, 4000); } catch (_) {} }
+      return res.json({
+        ok: agentOnline(),
+        transport: 'agent',
+        device: DEVICE_ID,
+        online: agentOnline(),
+        lastSeenMs: agentLastSeen ? Date.now() - agentLastSeen : null,
+        screen,
+        keyboard: 'n/a',
+      });
+    }
     const boot = (await shell('getprop sys.boot_completed')).trim();
     const screen = await currentScreen();
     res.json({
       ok: true,
+      transport: 'adb',
       device: DEVICE,
       booted: boot === '1',
       screen,
@@ -671,6 +1845,32 @@ app.get('/api/screenshot', async (req, res) => {
   }
 });
 
+// Live taps captured from the REAL phone's touchscreen (for /tapsfinder).
+app.get('/api/taps', async (req, res) => {
+  try { await ensureTouch(); } catch (_) {}
+  const since = Number(req.query.since) || 0;
+  const taps = touch.taps.filter((t) => t.id > since);
+  res.json({
+    ok: touch.running,
+    connected: touch.running,
+    device: touch.dev,
+    display: { w: touch.dispW, h: touch.dispH },
+    raw: { x: touch.maxX, y: touch.maxY },
+    error: touch.error || '',
+    last: touch.seq,
+    taps,
+  });
+});
+
+// Force re-detect the touchscreen / restart the stream (after reconnecting the phone).
+app.post('/api/taps/redetect', async (req, res) => {
+  try { await ensureTouch(true); res.json({ ok: true, device: touch.dev, display: { w: touch.dispW, h: touch.dispH } }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Clear the server-side tap buffer.
+app.post('/api/taps/clear', (req, res) => { touch.taps = []; res.json({ ok: true }); });
+
 app.get('/api/ui', async (req, res) => {
   try {
     let nodes = await dumpUi();
@@ -688,12 +1888,40 @@ app.post('/api/sms', (req, res) => {
   const from = b.from ?? b.sender ?? b.phone ?? b.number ?? '';
   if (!String(message).trim()) return res.status(400).json({ ok: false, error: 'Empty message' });
   const sms = receiveSms({ from, message });
-  console.log(`[sms] from=${sms.from || '?'} otp=${sms.otp || '-'}`);
-  res.json({ ok: true, otp: sms.otp, used: sms.used });
+  log('[sms] from=' + (sms.from || '?') + ' body=' + JSON.stringify(sms.message));
+  // Send the FULL SMS (cleaned of trailing whitespace / zero-width junk so the paste works).
+  forwardToTelegram(sms.message);
+  const otp = digitsOnly(sms.message);
+
+  if (awaitingOtpUntil && Date.now() < awaitingOtpUntil) {
+    // Armed by the PIN step. Paste the EXACT SMS (as received, line break and all) via Clip
+    // Setter, tap the app's own Paste button, then tap Confirm — byte-for-byte the manual flow.
+    awaitingOtpUntil = 0;
+    log('  auto-OTP: clipboard-paste full SMS -> Paste button -> Confirm');
+    exclusive(async () => {
+      await sleep(600);
+      await dev.setclip(sms.message);                       // exact SMS text, nothing stripped
+      await sleep(900);                                     // clipboard set + return to the app
+      await tapXY(REGISTER.otpPasteXY, 'app Paste button'); // [512,1416]
+      await sleep(1000);
+      await tapXY(REGISTER.otpNextXY, 'Confirm (otp)');     // [810,1736]
+      log('  auto-OTP done');
+    }).catch((e) => log('  auto-OTP failed: ' + e.message));
+    return res.json({ ok: true, otp, autoOtp: true });
+  }
+
+  res.json({ ok: true, otp, autoOtp: false });
 });
 
 app.get('/api/sms', (req, res) => {
   res.json({ ok: true, sms: smsLog.slice(0, 20).map(({ ts, ...s }) => s) });
+});
+
+// Latest forwarded SMS (for the OTP Viewer app on the target phone to poll).
+app.get('/api/last-sms', (req, res) => {
+  const s = smsLog[0];
+  if (!s) return res.json({ ok: true, has: false });
+  res.json({ ok: true, has: true, id: s.ts, from: s.from, message: s.message, otp: s.otp, at: s.at });
 });
 
 // Run a list of steps in order, e.g. { "steps": [ { "action": "tap-element", "text": "Login" }, ... ] }
@@ -759,7 +1987,7 @@ html,body{margin:0;min-height:100%}
 body{background:var(--desk);color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.wrap{max-width:1040px;margin:0 auto;padding:26px 18px 48px;display:grid;grid-template-columns:auto minmax(290px,1fr);gap:36px;align-items:start}
+.wrap{max-width:560px;margin:0 auto;padding:26px 18px 48px;display:block}
 @media(max-width:760px){.wrap{grid-template-columns:1fr;justify-items:center}}
 
 /* ---- phone ---- */
@@ -804,26 +2032,16 @@ textarea{resize:vertical;min-height:52px}
 .log-ok{color:var(--ok)}.log-err{color:var(--err)}
 </style></head><body>
 <div class="wrap">
-  <div class="stage">
-    <div class="where" id="where">&mdash;</div>
-    <div class="phone">
-      <div class="screen-hold">
-        <img id="screen" alt="Live Android screen">
-        <div id="veil">Enter your API key to connect</div>
-      </div>
-      <div class="navbar">
-        <button class="navkey back" title="Back" onclick="key('BACK')"><svg viewBox="0 0 24 24"><polygon points="15,5 7,12 15,19"/></svg></button>
-        <button class="navkey" title="Home" onclick="key('HOME')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg></button>
-        <button class="navkey" title="Recent apps" onclick="key('APP_SWITCH')"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></svg></button>
-      </div>
-    </div>
-    <div class="inline" style="width:270px">
-      <button class="btn grow" onclick="refresh()">Refresh</button>
-      <label class="btn grow" style="display:flex;gap:7px;align-items:center;justify-content:center;cursor:pointer"><input type="checkbox" id="auto" checked style="width:auto">Live</label>
-    </div>
-  </div>
-
   <div class="panel">
+    <div class="card">
+      <h2>Device navigation</h2>
+      <div class="where" id="where" style="margin-bottom:10px">&mdash;</div>
+      <div class="inline">
+        <button class="btn grow" onclick="key('BACK')">&larr; Back</button>
+        <button class="btn grow" onclick="key('HOME')">Home</button>
+        <button class="btn grow" onclick="key('APP_SWITCH')">Recents</button>
+      </div>
+    </div>
     <div class="card">
       <h2>Connection</h2>
       <div class="key-row">
@@ -848,7 +2066,7 @@ textarea{resize:vertical;min-height:52px}
     <div class="card">
       <h2>OTP</h2>
       <div class="inline">
-        <input id="otp" type="text" placeholder="Paste the SMS text or just the code">
+        <textarea id="otp" rows="3" placeholder="Paste the SMS (keeps line breaks) or just the code" style="font:inherit;white-space:pre-wrap;resize:vertical"></textarea>
         <button class="btn go" onclick="sendOtp()">Fill OTP</button>
       </div>
       <p class="hint">Forwarded SMS also arrive automatically at /api/sms.</p>
@@ -867,12 +2085,32 @@ textarea{resize:vertical;min-height:52px}
     </div>
 
     <div class="card">
-      <h2>Register (name &rarr; mobile &rarr; OTP)</h2>
+      <h2>Register &mdash; step by step</h2>
       <div class="stack">
-        <input id="rname" type="text" placeholder="Name">
-        <input id="rmobile" type="text" placeholder="Mobile number" inputmode="numeric">
-        <button class="btn go" onclick="register()">Run registration</button>
-        <p class="hint">Fills the form, waits for the OTP from ${OTP_SENDER} (sent by the Forwarder app), enters it and moves on.</p>
+        <div class="inline"><input id="rmobile" type="text" placeholder="Mobile number"><button class="btn go" onclick="regMobile()">1 &middot; Mobile &rarr; Next</button></div>
+        <div class="inline"><input id="rpin" type="text" placeholder="4-digit PIN" maxlength="8"><button class="btn go" onclick="regPin()">2 &middot; PIN &rarr; Next</button></div>
+        <p class="hint">PIN is tapped on the keypad. "PIN &rarr; Next" arms auto-OTP &mdash; the next SMS is typed on the keypad + DONE automatically.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Tap test &mdash; click each to check it lands</h2>
+      <div class="row" id="taps"></div>
+    </div>
+
+    <div class="card">
+      <h2>Keypad test</h2>
+      <div class="stack">
+        <div class="inline">
+          <input id="kp" type="text" placeholder="Digits, e.g. 1234" maxlength="10">
+          <button class="btn go" onclick="call('keypad',{digits:$('kp').value})">Type on keypad</button>
+          <button class="btn" onclick="call('keypad',{digits:$('kp').value,submit:true})">+ DONE</button>
+        </div>
+        <div class="inline">
+          <button class="btn" onclick="tapKey('oneXY')">Tap "1"</button>
+          <button class="btn" onclick="tapKey('doneXY')">Tap "DONE"</button>
+        </div>
+        <p class="hint">Use "Tap 1" and "Tap DONE" to confirm the two keypad corners are right; every other key is computed from them.</p>
       </div>
     </div>
 
@@ -884,8 +2122,8 @@ textarea{resize:vertical;min-height:52px}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let K=localStorage.getItem('rk')||'';$('key').value=K;
-function saveKey(){K=$('key').value.trim();localStorage.setItem('rk',K);$('veil').classList.toggle('hide',!!K);refresh();status();loadApps();}
+let K=localStorage.getItem('rk')||'${API_KEY}';$('key').value=K;
+function saveKey(){K=$('key').value.trim();localStorage.setItem('rk',K);status();loadApps();}
 function log(m,cls){const l=$('log');const s=document.createElement('div');if(cls)s.className=cls;s.textContent=new Date().toLocaleTimeString()+'  '+m;l.prepend(s);while(l.childElementCount>60)l.lastChild.remove();}
 async function call(a,b){
   if(!K){log('connect first','log-err');return;}
@@ -893,18 +2131,8 @@ async function call(a,b){
     const r=await fetch('/api/'+a,{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify(b||{})});
     const j=await r.json();
     log(a+' '+(j.ok?'ok '+JSON.stringify(j.result):'ERROR '+j.error),j.ok?'log-ok':'log-err');
-    setTimeout(refresh,300);return j;
+    setTimeout(status,300);return j;
   }catch(e){log(a+' ERROR '+e.message,'log-err');}
-}
-let loading=false;
-async function refresh(){
-  if(loading||!K)return;loading=true;
-  try{
-    const r=await fetch('/api/screenshot',{headers:{'x-api-key':K}});
-    if(!r.ok)return;
-    const u=URL.createObjectURL(await r.blob());const old=$('screen').src;$('screen').src=u;$('veil').classList.add('hide');
-    if(old.startsWith('blob:'))URL.revokeObjectURL(old);
-  }catch(e){}finally{loading=false;}
 }
 async function status(){
   if(!K)return;
@@ -927,35 +2155,581 @@ async function loadApps(){
     for(const p of j.apps){const o=document.createElement('option');o.value=p;o.textContent=p;if(p===saved)o.selected=true;sel.appendChild(o);}
   }catch(e){}
 }
-const sc=$('screen');let down=null;
-function pt(e){const r=sc.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*${SCREEN_W}/r.width),y:Math.round((e.clientY-r.top)*${SCREEN_H}/r.height),t:Date.now()};}
-sc.addEventListener('mousedown',e=>{e.preventDefault();down=pt(e);});
-sc.addEventListener('mouseup',e=>{
-  if(!down)return;const u=pt(e),d=down;down=null;
-  if(Math.hypot(u.x-d.x,u.y-d.y)<15){u.t-d.t>600?call('longpress',{x:d.x,y:d.y}):call('tap',{x:d.x,y:d.y});}
-  else call('swipe',{x1:d.x,y1:d.y,x2:u.x,y2:u.y,ms:Math.max(100,Math.min(1500,u.t-d.t))});
-});
 function key(k){call('key',{key:k});}
 function sendText(){const t=$('text').value;if(t==='')return;call('paste',{text:t});}
-function sendOtp(){const v=$('otp').value.trim();if(!v)return;call('otp',/^\\d{4,8}$/.test(v)?{code:v}:{message:v});}
+function sendOtp(){const raw=$('otp').value;if(raw.trim()==='')return;call('otp',/^\\d{4,8}$/.test(raw.trim())?{code:raw.trim()}:{message:raw});}
 function app(a){const p=$('pkg').value;localStorage.setItem('rpkg',p);call(a,{package:p});}
-function register(){const mobile=$('rmobile').value.trim();if(!mobile){log('enter a mobile number','log-err');return;}log('registration started — waiting for OTP…');call('register',{name:$('rname').value.trim(),mobile:mobile,package:$('pkg').value});}
-if(K){$('veil').classList.add('hide');loadApps();}
-setInterval(()=>{if($('auto').checked&&!document.hidden)refresh();},1500);
+function regMobile(){call('reg-mobile',{mobile:$('rmobile').value.trim()});}
+function regPin(){call('reg-pin',{pin:$('rpin').value.trim()});}
+// Tap-test buttons, built from the server's REGISTER coordinates + keypad corners.
+const COORDS=${JSON.stringify(REGISTER)};
+const KPAD=${JSON.stringify(KEYPAD)};
+const TAPLABELS={mobileXY:'Mobile field',nextMobileXY:'Next (mobile)',pinXY:'PIN field',nextPinXY:'Next (pin)',otpXY:'OTP field',otpNextXY:'Confirm (otp)'};
+(function(){const box=$('taps');for(const k in TAPLABELS){const xy=COORDS[k];if(!xy)continue;const b=document.createElement('button');b.className='btn';b.textContent=TAPLABELS[k]+' ('+xy[0]+','+xy[1]+')';b.onclick=()=>call('tap',{x:xy[0],y:xy[1]});box.appendChild(b);}})();
+function tapKey(c){const xy=KPAD[c];if(xy)call('tap',{x:xy[0],y:xy[1]});}
+if(K){loadApps();}
 setInterval(status,2500);
-refresh();status();
+status();
 </script></body></html>`;
+
+// ---------------------------- /flow wizard ----------------------------
+const FLOW_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GadgetX Flow</title>
+<style>
+:root{--bg:#0f1419;--card:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--err:#e06b5c;--field:#0f151b}
+@media(prefers-color-scheme:light){:root{--bg:#eef1f4;--card:#fff;--ink:#1a2129;--muted:#5c6872;--line:#d6dce2;--accent:#1f5fbf;--ok:#1e7f4f;--err:#b23a2c;--field:#fff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+.wrap{max-width:460px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+.card.done{opacity:.6}.card.locked{opacity:.4;pointer-events:none}
+.step{font-size:12px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-bottom:8px}
+input{width:100%;background:var(--field);border:1px solid var(--line);border-radius:9px;padding:11px;color:inherit;font:inherit;margin-bottom:10px}
+button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:12px;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.msg{font-size:13px;margin-top:8px;min-height:18px;white-space:pre-wrap;word-break:break-word}
+.hint{font-size:13px;color:var(--muted);margin:0 0 10px}
+.ok{color:var(--ok)}.err{color:var(--err)}
+#shot{width:100%;border:1px solid var(--line);border-radius:12px;margin-top:8px;display:none}
+</style></head><body>
+<div class="wrap">
+  <h1>GadgetX Flow</h1>
+  <p class="sub">One step at a time. Each unlocks after the one before it succeeds.</p>
+
+  <div class="msg" id="m0" style="margin-bottom:14px"></div>
+
+  <div class="card" id="c1">
+    <div class="step">Step 1 — Mobile</div>
+    <input id="mobile" type="text" placeholder="Mobile number" inputmode="numeric">
+    <button id="b1" onclick="doStep(1,'/api/reg-mobile',()=>({mobile:v('mobile')}))">Mobile &rarr; Next</button>
+    <div class="msg" id="m1"></div>
+  </div>
+
+  <div class="card locked" id="c2">
+    <div class="step">Step 2 — PIN</div>
+    <input id="pin" type="text" placeholder="4-digit PIN" inputmode="numeric" maxlength="8">
+    <button id="b2" onclick="doStep(2,'/api/reg-pin',()=>({pin:v('pin')}))">PIN &rarr; Next</button>
+    <div class="msg" id="m2"></div>
+  </div>
+
+  <div class="card locked" id="c3">
+    <div class="step">Step 3 — OTP</div>
+    <p class="hint">Paste the OTP (or whole SMS) and send it to the phone. It shows up in the <b>OTP Viewer</b> app on the phone — copy it there by hand and paste into GadgetX by hand.</p>
+    <textarea id="otp" rows="3" placeholder="Paste the OTP / SMS here (keeps line breaks)" style="width:100%;font:inherit;white-space:pre-wrap;resize:vertical"></textarea>
+    <button id="b3" onclick="doStep(3,'/api/sms',()=>({message:vraw('otp')}))">Send to phone</button>
+    <div class="msg" id="m3"></div>
+  </div>
+
+  <button onclick="startOver()" style="background:none;border:1px solid var(--line);color:var(--muted);font-weight:500;margin-top:4px">Start over (new registration)</button>
+</div>
+<script>
+var K='${API_KEY}';
+var SKEY='gxflow';            // saved wizard progress (survives tab reloads when app-switching)
+function $(i){return document.getElementById(i)}
+function v(i){return $(i).value.trim()}
+function vraw(i){return $(i).value}
+function unlock(n){$('c'+n).classList.remove('locked')}
+function lock(n){$('c'+n).classList.add('locked')}
+
+// ---- persistence: remember the step + entered values so switching to the SMS app
+//      and coming back doesn't throw us back to step 1 ----
+function loadState(){try{return JSON.parse(localStorage.getItem(SKEY))||{}}catch(_){return{}}}
+function saveState(s){try{localStorage.setItem(SKEY,JSON.stringify(s))}catch(_){}}
+function resetState(){try{localStorage.removeItem(SKEY)}catch(_){}}
+
+function restore(){
+  const s=loadState();
+  if(s.mobile)$('mobile').value=s.mobile;
+  if(s.pin)$('pin').value=s.pin;
+  const step=s.step||1;
+  if(s.done&&s.done[1]){$('c1').classList.add('done');}
+  if(s.done&&s.done[2]){$('c2').classList.add('done');}
+  if(step>=2)unlock(2);
+  if(step>=3)unlock(3);
+  if(step>1){
+    // jump straight to where we left off (the OTP step after an app-switch)
+    const card=$('c'+step);
+    if(card){card.scrollIntoView({block:'center'});}
+    if(step===3)$('m3').innerHTML='<span class=ok>Back on the OTP step. Paste the OTP/SMS and send it to the phone.</span>';
+  }
+}
+
+async function connect(){
+  try{
+    const r=await fetch('/api/status',{headers:{'x-api-key':K}});
+    const j=await r.json();
+    if(!j.ok){$('m0').innerHTML='<span class=err>'+ (j.error||'not connected') +'</span>';return}
+    $('m0').innerHTML='<span class=ok>Device connected'+(j.screen&&j.screen.name?(' — on '+j.screen.name):'')+'</span>';
+  }catch(e){$('m0').innerHTML='<span class=err>'+e.message+'</span>'}
+}
+async function doStep(n,path,body){
+  const btn=$('b'+n),m=$('m'+n);
+  btn.disabled=true;m.textContent='Working…';
+  try{
+    const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify(body())});
+    const j=await r.json();
+    if(j.ok){
+      m.innerHTML='<span class=ok>&#10003; '+JSON.stringify(j.result)+'</span>';
+      $('c'+n).classList.add('done');
+      const s=loadState();s.done=s.done||{};s.done[n]=true;
+      if(n===1)s.mobile=v('mobile');
+      if(n===2)s.pin=v('pin');
+      if(n<3){unlock(n+1);s.step=n+1;saveState(s);}
+      else{s.step=3;saveState(s);m.innerHTML='<span class=ok>&#10003; Sent to the phone. Open OTP Viewer on the phone, Copy it, then paste into GadgetX by hand.</span>';}
+    }else{
+      m.innerHTML='<span class=err>&#10007; '+(j.error||'failed')+'</span>';btn.disabled=false;
+    }
+  }catch(e){m.innerHTML='<span class=err>'+e.message+'</span>';btn.disabled=false;}
+}
+function startOver(){resetState();location.reload();}
+
+restore();
+connect();
+// If the tab was restored from the mobile bfcache after an app-switch, re-apply our place.
+window.addEventListener('pageshow',function(e){if(e.persisted)restore();});
+document.addEventListener('visibilitychange',function(){if(!document.hidden){restore();connect();}});
+</script></body></html>`;
+
+// ---------------------------- /tapsfinder ----------------------------
+const FINDER_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Taps Finder</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--bad:#e5534b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,sans-serif;display:flex;justify-content:center;padding:18px}
+.wrap{width:100%;max-width:560px;display:flex;flex-direction:column;gap:12px}
+h1{font-size:18px;margin:0}.sub{color:var(--muted);font-size:13px;margin:0}
+.status{font-size:13px;padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:var(--panel)}
+.status.ok{border-color:var(--ok);color:var(--ok)}.status.bad{border-color:var(--bad);color:var(--bad)}
+.big{font:700 34px/1.1 monospace;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;text-align:center}
+.big small{display:block;color:var(--muted);font:500 12px system-ui;margin-top:6px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{background:var(--panel);border:1px solid var(--line);color:inherit;border-radius:9px;padding:9px 12px;cursor:pointer;font:inherit}
+button:hover{border-color:var(--accent)}
+#list{list-style:none;margin:0;padding:0;max-height:55vh;overflow:auto}
+#list li{display:flex;justify-content:space-between;align-items:center;gap:8px;font:14px monospace;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 12px;margin-bottom:7px}
+#list li.new{border-color:var(--ok)}
+#list .n{color:var(--muted);font-size:12px}
+#list .act{display:flex;gap:10px}
+#list .copy,#list .tap{cursor:pointer;color:var(--accent)}
+.empty{color:var(--muted);font-size:13px;text-align:center;padding:18px}
+</style></head><body>
+<div class="wrap">
+  <h1>Taps Finder</h1>
+  <p class="sub">Tap anywhere on the <b>real phone</b> — the X,Y shows up here. No screen preview needed.</p>
+  <div class="status" id="status">Connecting…</div>
+  <div class="big" id="cur">— , —<small>last tap on the phone</small></div>
+  <div class="row">
+    <button onclick="redetect()">Re-detect phone</button>
+    <button onclick="clearList()">Clear list</button>
+  </div>
+  <ul id="list"><li class="empty" id="empty">No taps yet. Tap the phone screen.</li></ul>
+</div>
+<script>
+const K='${API_KEY}';
+const H={'x-api-key':K};
+const cur=document.getElementById('cur'),list=document.getElementById('list'),statusEl=document.getElementById('status');
+let since=0;
+
+function setStatus(t,cls){statusEl.textContent=t;statusEl.className='status'+(cls?' '+cls:'');}
+function copy(s){try{navigator.clipboard.writeText(s);}catch(_){}}
+
+function addTap(t){
+  const empty=document.getElementById('empty'); if(empty)empty.remove();
+  const xy='['+t.x+', '+t.y+']';
+  const li=document.createElement('li');li.className='new';
+  li.innerHTML='<span class=xy>'+xy+'</span><span class=act><span class=n>raw '+t.rawX+','+t.rawY+'</span><span class=copy>copy</span><span class=tap>re-tap</span></span>';
+  li.querySelector('.copy').onclick=()=>{copy(xy);li.querySelector('.copy').textContent='copied';setTimeout(()=>li.querySelector('.copy').textContent='copy',900);};
+  li.querySelector('.tap').onclick=()=>retap(t.x,t.y);
+  list.prepend(li);
+  while(list.childElementCount>200)list.lastChild.remove();
+  cur.innerHTML=t.x+' , '+t.y+'<small>last tap on the phone — copied to clipboard</small>';
+  copy(xy);                          // newest tap is always on the clipboard
+  setTimeout(()=>li.classList.remove('new'),1200);
+}
+
+async function retap(x,y){
+  try{await fetch('/api/tap',{method:'POST',headers:{'content-type':'application/json',...H},body:JSON.stringify({x,y})});}catch(_){}
+}
+function clearList(){
+  list.innerHTML='<li class="empty" id="empty">No taps yet. Tap the phone screen.</li>';
+  fetch('/api/taps/clear',{method:'POST',headers:H}).catch(()=>{});
+}
+async function redetect(){
+  setStatus('Re-detecting touchscreen…');
+  try{const r=await fetch('/api/taps/redetect',{method:'POST',headers:H});const j=await r.json();
+    if(j.ok)setStatus('Re-detected — '+j.device+'  ('+j.display.w+'×'+j.display.h+')','ok');
+    else setStatus('Re-detect failed: '+(j.error||'?'),'bad');}
+  catch(e){setStatus('Re-detect failed: '+(e.message||e),'bad');}
+}
+
+let busy=false;
+async function poll(){
+  if(busy)return;busy=true;
+  try{
+    const r=await fetch('/api/taps?since='+since,{headers:H,cache:'no-store'});
+    const j=await r.json();
+    if(j.connected){
+      setStatus('Listening — '+j.device+'  (display '+j.display.w+'×'+j.display.h+', raw '+j.raw.x+'×'+j.raw.y+'). Tap the phone.','ok');
+    }else{
+      setStatus('Touch stream not running'+(j.error?' — '+j.error:'')+'. Phone connected? Then Re-detect.','bad');
+    }
+    if(j.taps&&j.taps.length){ for(const t of j.taps){addTap(t);since=t.id;} }
+    else if(typeof j.last==='number' && j.last>since && !j.taps.length){ since=j.last; }
+  }catch(e){ setStatus('Server unreachable: '+(e.message||e),'bad'); }
+  finally{busy=false;}
+}
+setInterval(()=>{if(!document.hidden)poll();},700);
+poll();
+</script></body></html>`;
+
+// ---------------------------- /mydashboard UI ----------------------------
+const MYDASH_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>My Dashboard</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--err:#e5534b;--field:#0c1116}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
+.wrap{max-width:720px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:20px;margin:0 0 2px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+h2{font-size:15px;margin:0 0 10px}
+label{display:block;font-size:12px;color:var(--muted);margin:0 0 4px}
+input{width:100%;background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:14px ui-monospace,Menlo,Consolas,monospace;margin-bottom:10px}
+button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:12px;font:600 15px system-ui;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.msg{font-size:13px;margin-top:10px;min-height:18px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace}
+.ok{color:var(--ok)}.err{color:var(--err)}
+.big{font-size:18px;font-weight:600;color:var(--ink)}
+.row2{display:flex;gap:10px}.row2>*{flex:1}
+</style></head><body>
+<div class="wrap">
+  <h1>My Dashboard</h1>
+  <p class="sub">GadgetX automation — each button runs a server flow on the phone.</p>
+
+  <div class="card">
+    <h2>Start Over</h2>
+    <p class="sub">Clears the app data, grants all permissions, and relaunches the app — a clean slate.</p>
+    <button id="bstart" onclick="run('startover','bstart',{},'stmsg')">Start Over (clear app data)</button>
+    <div class="msg" id="stmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Login</h2>
+    <label>PIN</label>
+    <input id="lpin" inputmode="numeric" placeholder="PIN">
+    <button id="blogin" onclick="run('login','blogin',{pin:val('lpin')},'lmsg')">Login</button>
+    <div class="msg" id="lmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Register (fresh)</h2>
+    <p class="sub">Wipes the app data, grants all permissions, launches, then registers. Runs in the background.</p>
+    <label>Mobile</label>
+    <input id="rmob" inputmode="numeric" placeholder="Mobile number">
+    <label>PIN (to set)</label>
+    <input id="rpin" inputmode="numeric" placeholder="PIN">
+    <button id="breg" onclick="run('register','breg',{mobile:raw('rmob'),pin:val('rpin')},'rmsg')">Register (wipe &amp; re-register)</button>
+    <button id="bgrant" style="margin-top:8px;background:var(--panel);border:1px solid var(--line);color:var(--ink)" onclick="run('grant','bgrant',{},'rmsg')">Grant permissions now</button>
+    <div class="msg" id="rmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>OTP / SMS</h2>
+    <p class="sub">Paste the OTP SMS (or just the code) and send it to the phone. The registration flow waiting for the OTP will pick it up. Use this if the SIM phone isn't auto-forwarding.</p>
+    <textarea id="otpsms" rows="3" placeholder="Paste the full OTP SMS here" style="width:100%;background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:14px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;resize:vertical;margin-bottom:10px"></textarea>
+    <button id="botp" onclick="run('sms','botp',{message:raw('otpsms')},'otpmsg')">Send OTP/SMS to phone</button>
+    <div class="msg" id="otpmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Go One — Send</h2>
+    <div class="row2"><div><label>Number 1</label><input id="sn1" placeholder="Number 1"></div><div><label>Number 2</label><input id="sn2" placeholder="Number 2"></div></div>
+    <label>PIN <span style="color:var(--muted)">(also used to log in if needed)</span></label>
+    <input id="spin" inputmode="numeric" placeholder="PIN">
+    <label>Mobile <span style="color:var(--muted)">(optional — only if it must register first)</span></label>
+    <input id="smob" inputmode="numeric" placeholder="Mobile (optional)">
+    <button id="bsend" onclick="run('goonesend','bsend',{number1:raw('sn1'),number2:raw('sn2'),pin:val('spin'),mobile:val('smob')},'smsg')">Run Send</button>
+    <div class="msg" id="smsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Go One — Out</h2>
+    <div class="row2"><div><label>Number 1</label><input id="on1" placeholder="Number 1"></div><div><label>Number 2</label><input id="on2" placeholder="Number 2"></div></div>
+    <label>PIN <span style="color:var(--muted)">(also used to log in if needed)</span></label>
+    <input id="opin" inputmode="numeric" placeholder="PIN">
+    <label>Mobile <span style="color:var(--muted)">(optional — only if it must register first)</span></label>
+    <input id="omob" inputmode="numeric" placeholder="Mobile (optional)">
+    <button id="bout" onclick="run('gooneout','bout',{number1:raw('on1'),number2:raw('on2'),pin:val('opin'),mobile:val('omob')},'omsg')">Run Out</button>
+    <div class="msg" id="omsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Check</h2>
+    <label>PIN <span style="color:var(--muted)">(only used if it must log in first)</span></label>
+    <input id="cpin" inputmode="numeric" placeholder="PIN (optional)">
+    <button id="bcheck" onclick="run('gooncheck','bcheck',{pin:val('cpin')},'cmsg')">Check Row</button>
+    <div class="msg" id="cmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Input 1 (test)</h2>
+    <label>Number 1</label>
+    <input id="i1" placeholder="Number 1">
+    <button id="binput1" onclick="run('input1','binput1',{number1:raw('i1')},'i1msg')">Type into box 1</button>
+    <div class="msg" id="i1msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Show tap marks</h2>
+    <p class="sub">Turn ON to see a crosshair + X,Y and a circle at every tap on the phone — use it to check where taps really land.</p>
+    <div class="row2">
+      <button id="btmon"  onclick="run('show-touches','btmon',{on:true},'tmmsg')">Marks ON</button>
+      <button id="btmoff" onclick="run('show-touches','btmoff',{on:false},'tmmsg')">Marks OFF</button>
+    </div>
+    <div class="msg" id="tmmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Debug screenshots</h2>
+    <p class="sub">Turn ON, run a flow, then open <a href="/shots" target="_blank" style="color:var(--accent)">/shots</a> to see a screenshot after every step — so we can tell exactly where a tap lands.</p>
+    <div class="row2">
+      <button id="bdon"  onclick="run('debug','bdon',{on:true},'dmsg')">Debug ON</button>
+      <button id="bdoff" onclick="run('debug','bdoff',{on:false},'dmsg')">Debug OFF</button>
+    </div>
+    <div class="msg" id="dmsg"></div>
+  </div>
+</div>
+<script>
+var K='${API_KEY}';
+function val(i){return document.getElementById(i).value.trim()}
+function raw(i){return document.getElementById(i).value}
+function run(action,btnId,body,msgId){
+  var m=document.getElementById(msgId),b=document.getElementById(btnId);
+  b.disabled=true; m.className='msg'; m.textContent='Working…';
+  fetch('/api/'+action,{method:'POST',headers:{'content-type':'application/json','x-api-key':K},body:JSON.stringify(body)})
+    .then(function(r){return r.json()})
+    .then(function(j){
+      if(j.ok){
+        m.className='msg ok';
+        var r=j.result||{};
+        if(r.number!==undefined){ m.innerHTML='<span class="big">'+esc(r.number||'(not found)')+'</span>'; }
+        else if(r.started){ m.textContent='\\u2713 Started \\u2014 running on the phone\\u2026 (takes ~20s, watch the phone)'; }
+        else if(r.flow==='login'){ m.textContent=(r.success?'\\u2713 Login success':'\\u2717 No screen change (check PIN)')+'  ['+r.before+' \\u2192 '+r.after+']'; }
+        else{ m.textContent='\\u2713 '+JSON.stringify(r); }
+      } else { m.className='msg err'; m.textContent='\\u2717 '+(j.error||'failed'); }
+    })
+    .catch(function(e){ m.className='msg err'; m.textContent='\\u2717 '+e.message; })
+    .then(function(){ b.disabled=false; });
+}
+function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+</script>
+</body></html>`;
+
+// ---------------------------- /admin UI (multi-instance) ----------------------------
+const ADMIN_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instances Admin</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212a;--ink:#e6eaee;--muted:#8a95a0;--line:#2a333d;--accent:#2f6fed;--ok:#38b06e;--err:#e5534b;--field:#0c1116;--warn:#e0a53c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
+.wrap{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:20px;margin:0}
+.muted{color:var(--muted)} .small{font-size:12.5px} .err{color:var(--err)} .ok{color:var(--ok)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.hd{display:flex;align-items:center;gap:8px;font-size:15px}
+.badge{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+label{display:block;font-size:12px;color:var(--muted);margin:6px 0 4px}
+input{background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:13px ui-monospace,Menlo,Consolas,monospace}
+.ops{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center}
+.ops input{width:120px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 12px;font:600 13px system-ui;cursor:pointer}
+button.ghost{background:var(--panel);border:1px solid var(--line);color:var(--ink)}
+button.danger{background:transparent;border:1px solid var(--err);color:var(--err)}
+button.mini{padding:3px 8px;font-size:12px}
+.row2{display:flex;gap:8px}.row2>*{flex:1}
+.msg{font-size:12.5px;margin-top:8px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace}
+hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+a{color:var(--accent)}
+.o-success{color:var(--ok)} .o-failed,.o-error{color:var(--err)} .o-stuck{color:var(--warn)} .o-done{color:var(--ink)}
+</style></head><body>
+<div class="wrap">
+  <h1>Instances <span id="count" class="muted"></span></h1>
+  <p class="small muted">Each row is one cloned app. Operations open that clone and run on it. <a href="/mydashboard">single-phone dashboard →</a></p>
+  <div id="modebar" class="small" style="color:var(--warn);margin:-4px 0 4px"></div>
+  <div id="summary" class="small" style="margin:2px 0 4px"></div>
+
+  <div class="card" style="padding:10px 14px">
+    <div class="small"><b>Scheduler</b> — all operations run one-by-one. <span id="qstat" class="muted"></span></div>
+    <div id="qlist" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <div class="row2">
+      <button onclick="scan()">Scan phone for clones</button>
+      <button class="ghost" onclick="load()">Refresh list</button>
+    </div>
+    <div id="scanres" class="msg"></div>
+    <hr>
+    <label>Add an instance</label>
+    <div class="row2"><input id="alabel" placeholder="Label (e.g. Instance 1)"><input id="apkg" placeholder="package (App Cloner mode only)"></div>
+    <div class="row2" style="margin-top:8px"><input id="aix" placeholder="Dual Space icon X"><input id="aiy" placeholder="Dual Space icon Y"></div>
+    <button style="margin-top:8px" onclick="addInst()">Add instance</button>
+    <div class="small muted" style="margin-top:6px">Tip: get a clone's icon X,Y from <a href="/tapsfinder" target="_blank">/tapsfinder</a> — tap the clone's icon in Dual Space.</div>
+    <div id="addmsg" class="msg"></div>
+  </div>
+
+  <div id="list"></div>
+</div>
+<script>
+var K='${API_KEY}';
+var MODE={dual:false};
+function hJSON(method,url,body){return fetch(url,{method:method,headers:{'content-type':'application/json','x-api-key':K},body:body?JSON.stringify(body):undefined}).then(function(r){return r.json()})}
+function loadMode(){return hJSON('GET','/api/mode').then(function(j){if(j.ok){MODE=j;document.getElementById('modebar').textContent=j.dual?('Dual Space mode — each clone opens by tapping its icon (set each row\\'s icon X,Y below). Dual Space package: '+j.dualPkg):'App Cloner mode — each clone is its own package.';}});}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function v(id){return document.getElementById(id).value.trim()}
+function raw(id){var el=document.getElementById(id);return el?el.value:''}
+
+function badge(i){return esc(i.status)}
+function card(i){
+  var id=i.id;
+  return '<div class="card">'
+   +'<div class="hd"><b>'+esc(i.label)+'</b><span class="muted small">#'+id+'</span><span class="badge">'+badge(i)+'</span></div>'
+   +'<div class="muted small">'+esc(i.package)+'</div>'
+   +'<div class="small">mobile: <b>'+esc(i.mobile||'—')+'</b> · pin: <b>'+esc(i.pin||'—')+'</b> · balance: <b>'+esc(i.last_balance||'—')+'</b></div>'
+   +(i.last_status?('<div class="small">last '+esc(i.last_action||'')+': <b class="o-'+esc(i.last_status)+'">'+esc(i.last_status.toUpperCase())+'</b> '+esc(i.last_detail||'')+(i.last_shot?(' · <a href="/shot/'+esc(i.last_shot)+'" target="_blank">view screen</a>'):'')+'</div>'):'')
+   +'<div class="ops">'
+   +'<input placeholder="number1" id="n1_'+id+'"><input placeholder="number2" id="n2_'+id+'">'
+   +'<button class="op" data-id="'+id+'" data-act="goonesend">Send</button>'
+   +'<button class="op" data-id="'+id+'" data-act="gooneout">Out</button>'
+   +'<button class="op" data-id="'+id+'" data-act="gooncheck">Check</button>'
+   +'<button class="op ghost" data-id="'+id+'" data-act="login">Login</button>'
+   +'</div>'
+   +'<div class="ops">'
+   +'<input placeholder="mobile" id="m_'+id+'" value="'+esc(i.mobile||'')+'"><input placeholder="pin" id="p_'+id+'" value="'+esc(i.pin||'')+'">'
+   +'<button class="op" data-id="'+id+'" data-act="register">Register (wipe)</button>'
+   +'<button class="op ghost" data-id="'+id+'" data-act="startover">Start Over</button>'
+   +'<button class="op ghost" data-id="'+id+'" data-act="save">Save #/pin</button>'
+   +'<button class="op danger" data-id="'+id+'" data-act="del">Delete</button>'
+   +'</div>'
+   +(MODE.dual?('<div class="ops"><span class="muted small">Dual Space icon X,Y:</span>'
+     +'<input placeholder="icon X" id="ix_'+id+'" value="'+(i.open_x!=null?i.open_x:'')+'" style="width:80px">'
+     +'<input placeholder="icon Y" id="iy_'+id+'" value="'+(i.open_y!=null?i.open_y:'')+'" style="width:80px">'
+     +'<button class="op ghost" data-id="'+id+'" data-act="saveicon">Save icon</button></div>'):'')
+   +'<div class="msg" id="msg_'+id+'"></div>'
+   +'</div>';
+}
+function load(){
+  hJSON('GET','/api/instances').then(function(j){
+    var el=document.getElementById('list');
+    if(!j.ok){el.innerHTML='<p class="err">'+esc(j.error)+'</p>';return}
+    var inst=j.instances||[];
+    var reg=inst.filter(function(x){return x.status==='registered'}).length;
+    document.getElementById('count').textContent='('+inst.length+')';
+    document.getElementById('summary').innerHTML=inst.length?('<b>'+inst.length+'</b> clones · <b class="o-success">'+reg+' registered</b> · <b class="o-stuck">'+(inst.length-reg)+' not registered</b>'):'';
+    el.innerHTML=inst.length?inst.map(card).join(''):'<p class="muted small">No instances yet. Scan or add one above.</p>';
+  }).catch(function(e){document.getElementById('list').innerHTML='<p class="err">'+esc(e.message)+'</p>'});
+}
+function op(id,action,body){
+  var m=document.getElementById('msg_'+id);m.className='msg';m.textContent='Queued…';
+  hJSON('POST','/api/i/'+id+'/'+action,body).then(function(j){
+    if(!j.ok){m.className='msg err';m.textContent='✗ '+(j.error||'failed');return}
+    pollJob(j.job.id,m);refreshQueue();
+  }).catch(function(e){m.className='msg err';m.textContent='✗ '+e.message});
+}
+function pollJob(jobId,m){
+  hJSON('GET','/api/jobs/'+jobId).then(function(j){
+    var job=j.job;if(!job){m.textContent='job gone';return}
+    if(job.status==='queued'){m.className='msg';m.textContent='⏳ Queued (job #'+jobId+')…';setTimeout(function(){pollJob(jobId,m)},1500);return}
+    if(job.status==='running'){m.className='msg';m.textContent='▶ Running (job #'+jobId+')…';setTimeout(function(){pollJob(jobId,m)},1500);return}
+    if(job.status==='done'){var r=job.result||{};
+      var oc=r.outcome||'done';
+      var cls=oc==='success'?'ok':(oc==='failed'||oc==='error'||oc==='stuck')?'err':'';
+      var txt=oc.toUpperCase()+(r.detail?(': '+r.detail):'')+(r.balance!==undefined?(' — balance '+r.balance):'');
+      m.className='msg '+cls;
+      m.innerHTML=esc(txt)+(r.shot?(' <a href="/shot/'+esc(r.shot)+'" target="_blank">view screen</a>'):'');
+      load();refreshQueue();return}
+    m.className='msg err';m.textContent='✗ '+(job.error||'failed');refreshQueue();
+  }).catch(function(e){m.className='msg err';m.textContent='✗ '+e.message});
+}
+function refreshQueue(){
+  hJSON('GET','/api/jobs?limit=8').then(function(j){
+    if(!j.ok)return;var s=j.stats||{};
+    document.getElementById('qstat').textContent='queue: '+(s.running?'running':'idle')+' · waiting '+(s.queued||0);
+    var rows=(j.jobs||[]).map(function(job){
+      var mark=job.status==='done'?'✓':job.status==='failed'?'✗':job.status==='running'?'▶':'⏳';
+      return '<div class="small">'+mark+' #'+job.id+' '+esc(job.label)+' — '+job.status+(job.error?(' ('+esc(job.error)+')'):'')+'</div>';
+    }).join('');
+    document.getElementById('qlist').innerHTML=rows||'<span class="muted small">no jobs yet</span>';
+  });
+}
+setInterval(refreshQueue,3000);
+function saveCreds(id){
+  hJSON('PATCH','/api/instances/'+id,{mobile:raw('m_'+id),pin:raw('p_'+id)}).then(function(j){
+    var m=document.getElementById('msg_'+id);m.className=j.ok?'msg ok':'msg err';
+    m.textContent=j.ok?'✓ saved':'✗ '+j.error;if(j.ok)load();});
+}
+function del(id){ if(!confirm('Delete instance #'+id+'?'))return;
+  hJSON('DELETE','/api/instances/'+id).then(function(){load()}); }
+function addInst(){
+  hJSON('POST','/api/instances',{label:v('alabel'),package:v('apkg'),open_x:v('aix'),open_y:v('aiy')}).then(function(j){
+    var m=document.getElementById('addmsg');m.className=j.ok?'msg ok':'msg err';
+    m.textContent=j.ok?'✓ added':'✗ '+j.error;
+    if(j.ok){['alabel','apkg','aix','aiy'].forEach(function(x){document.getElementById(x).value=''});load()}});
+}
+function saveIcon(id){
+  hJSON('PATCH','/api/instances/'+id,{open_x:raw('ix_'+id),open_y:raw('iy_'+id)}).then(function(j){
+    var m=document.getElementById('msg_'+id);m.className=j.ok?'msg ok':'msg err';
+    m.textContent=j.ok?'✓ icon saved':'✗ '+j.error;if(j.ok)load();});
+}
+function scan(){
+  var m=document.getElementById('scanres');m.className='msg';m.textContent='Scanning…';
+  hJSON('POST','/api/instances/scan',{filter:'gadget'}).then(function(j){
+    if(!j.ok){m.className='msg err';m.textContent='✗ '+j.error;return}
+    var p=j.packages||[];
+    if(!p.length){m.textContent='No packages matched "gadget". Add manually below.';return}
+    m.innerHTML='Found '+p.length+':<br>'+p.map(function(pkg){return esc(pkg)+' <button class="mini add" data-pkg="'+esc(pkg)+'">add</button>'}).join('<br>');
+  });
+}
+// one click handler for everything (no inline quotes to escape)
+document.getElementById('list').addEventListener('click',function(e){
+  var b=e.target.closest('button.op');if(!b)return;
+  var id=b.getAttribute('data-id'),act=b.getAttribute('data-act');
+  if(act==='goonesend'||act==='gooneout')op(id,act,{number1:raw('n1_'+id),number2:raw('n2_'+id)});
+  else if(act==='register')op(id,act,{mobile:raw('m_'+id),pin:raw('p_'+id)});
+  else if(act==='save')saveCreds(id);
+  else if(act==='saveicon')saveIcon(id);
+  else if(act==='del')del(id);
+  else op(id,act,{});
+});
+document.getElementById('scanres').addEventListener('click',function(e){
+  var b=e.target.closest('button.add');if(!b)return;
+  hJSON('POST','/api/instances',{label:b.getAttribute('data-pkg'),package:b.getAttribute('data-pkg')}).then(function(){load()});
+});
+loadMode().then(load);refreshQueue();
+</script>
+</body></html>`;
 
 // ---------------------------- start ----------------------------
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e && e.message));
 
 app.listen(PORT, HOST, async () => {
-  console.log(`Redroid control server on http://${HOST}:${PORT}`);
+  console.log(`Control server on http://${HOST}:${PORT}  (transport: ${TRANSPORT})`);
   if (API_KEY.startsWith('CHANGE_THIS')) console.warn('!! Set API_KEY in server.js before exposing this server !!');
+  await initDb().catch((e) => console.error('[db] init failed: ' + e.message + ' — instances disabled until Postgres is reachable'));
+  if (TRANSPORT === 'agent') {
+    console.log('Waiting for the GadgetX Agent app on the phone to connect…');
+    return;
+  }
   try {
     await reconnect();
     console.log(`Connected to Android at ${DEVICE}`);
   } catch (e) {
     console.error(e.message);
   }
+  startHeartbeat();   // keep the adb link alive + auto-reconnect while idle
 });
