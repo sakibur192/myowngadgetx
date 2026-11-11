@@ -2569,6 +2569,13 @@ a{color:var(--accent)}
   </div>
 
   <div class="card">
+    <div class="small"><b>OTP / SMS</b> — when a Register is waiting for the OTP, paste the SMS (or just the code) and send it to the phone.</div>
+    <textarea id="otpsms" rows="2" placeholder="Paste the OTP SMS or the code here" style="width:100%;margin-top:8px;background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:14px ui-monospace,Menlo,Consolas,monospace;resize:vertical"></textarea>
+    <button style="margin-top:8px" onclick="sendSms()">Send OTP/SMS to phone</button>
+    <div class="msg" id="smsmsg"></div>
+  </div>
+
+  <div class="card">
     <div class="row2">
       <button onclick="scan()">Scan phone for clones</button>
       <button class="ghost" onclick="load()">Refresh list</button>
@@ -2685,6 +2692,13 @@ function saveIcon(id){
   hJSON('PATCH','/api/instances/'+id,{open_x:raw('ix_'+id),open_y:raw('iy_'+id)}).then(function(j){
     var m=document.getElementById('msg_'+id);m.className=j.ok?'msg ok':'msg err';
     m.textContent=j.ok?'✓ icon saved':'✗ '+j.error;if(j.ok)load();});
+}
+function sendSms(){
+  var m=document.getElementById('smsmsg');m.className='msg';m.textContent='Sending…';
+  hJSON('POST','/api/sms',{message:raw('otpsms')}).then(function(j){
+    m.className=j.ok?'msg ok':'msg err';
+    m.textContent=j.ok?('✓ sent to phone'+(j.otp?(' — code '+j.otp):'')):('✗ '+(j.error||'failed'));
+  }).catch(function(e){m.className='msg err';m.textContent='✗ '+e.message});
 }
 function scan(){
   var m=document.getElementById('scanres');m.className='msg';m.textContent='Scanning…';

@@ -33,7 +33,7 @@ module.exports = {
   // (If instead you use App Cloner — each clone a separate package — set enabled:false.)
   DUAL_SPACE: {
     enabled: true,
-    pkg: 'multi.parallel.dualspace.cloner',   // Dual Space's OWN package — confirm with: pm list packages | grep -i dual
+    pkg: 'multi.parallel.dualspace.cloner',   // the cloner app's OWN package (Multi Parallel – Dual Space)
     launchWaitMs: 2500,             // wait after launching Dual Space before tapping an icon
     openWaitMs: 4000,               // wait after tapping a clone icon for the app to open
 
@@ -48,7 +48,7 @@ module.exports = {
   },
 
   // ===== Database (cloned instances + their saved mobile/PIN). Install once: npm install pg =====
-  DATABASE_URL:'postgres://postgres:91CCK4MrTdXbBU3dU86Y49o7VGkQiSsusBQJUDRhwNrtB8v8hfseh6PMjMrWRtoX@76.13.223.236:5470/postgres',
+  DATABASE_URL: 'postgres://postgres:91CCK4MrTdXbBU3dU86Y49o7VGkQiSsusBQJUDRhwNrtB8v8hfseh6PMjMrWRtoX@76.13.223.236:5470/postgres',
 
   // ===== OTP / SMS =====
   OTP_REGEX: /\b(\d{4,8})\b/,              // how the OTP is pulled from an SMS
